@@ -21,7 +21,7 @@ from agentchess.models import (
     new_id,
 )
 from agentchess.openings import get_opening
-from agentchess.players.base import GameEnd, GameStart, Player
+from agentchess.players.base import GameEnd, GameStart, InfrastructureError, Player
 from agentchess.players.random_player import RandomPlayer
 
 
@@ -148,6 +148,22 @@ async def test_exception_is_error_forfeit():
     assert game.result == "0-1"
     assert game.termination == Termination.ERROR
     assert "boom" in game.termination_detail
+
+
+async def test_infrastructure_failure_aborts_unrated():
+    db = Database(":memory:")
+    for pid in ("w", "b"):
+        db.add_player(spec(pid))
+    game = new_game()
+    db.add_game(game)
+    white = Scripted("w", ["e4"])
+    black = Scripted("b", [InfrastructureError("environment variable KEY is not set")])
+    game = await play_game(game, white, black, db=db)
+    assert game.status == GameStatus.ABORTED
+    assert game.result == "*" and game.termination == Termination.ABORTED
+    assert "infrastructure failure" in game.termination_detail
+    assert db.rated_results() == []
+    assert "close" in white.calls and "close" in black.calls
 
 
 class BadStart(Scripted):
@@ -295,3 +311,20 @@ def test_movetext():
     black_first = chess.Board("4k3/8/8/8/8/8/4P3/4K3 b - - 0 7")
     assert movetext(black_first, ["Kd7", "e4", "Ke6"]) == "7... Kd7 8. e4 Ke6"
     assert movetext(board, []) == ""
+
+
+async def test_garbage_comment_and_usage_do_not_abort_game():
+    """Untrusted player output (e.g. a remote agent sending a JSON object as comment over the
+    WebSocket) must be sanitised, not crash persistence and leave the game unrated."""
+    db = Database(":memory:")
+    for pid in ("w", "b"):
+        db.add_player(spec(pid))
+    game = new_game(max_plies=4)
+    db.add_game(game)
+    white = Scripted("w", [MoveResponse(move="e2e4", comment={"x": 1}, usage=["junk"]),
+                           MoveResponse(move="d2d4", comment=["a"])])
+    black = Scripted("b", ["e7e5", "d7d5"])
+    await play_game(game, white, black, db=db)
+    stored = db.get_game(game.id)
+    assert stored.status == GameStatus.FINISHED and stored.termination == Termination.MAX_PLIES
+    assert stored.moves[0].comment == "{'x': 1}" and len(stored.moves) == 4

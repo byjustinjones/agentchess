@@ -225,6 +225,20 @@ class TournamentManager:
             self._publish_tournament(tournament_id)
         self._ensure_loop(tournament_id)
 
+    async def retry_aborted(self, tournament_id: str) -> int:
+        """Reschedule the tournament's ABORTED games (e.g. after a provider outage or a
+        cancel) and run them. Reopens a FINISHED/CANCELLED tournament. Returns the count."""
+        t = self._get(tournament_id)
+        n = self.db.reschedule_aborted(tournament_id)
+        if n == 0:
+            return 0
+        if t.status in (TournamentStatus.FINISHED, TournamentStatus.CANCELLED):
+            t.status = TournamentStatus.PAUSED
+            t.finished_at = None
+            self.db.update_tournament(t)
+        await self.start(tournament_id)
+        return n
+
     async def pause(self, tournament_id: str) -> None:
         """Stop launching new games; games already running finish normally."""
         t = self._get(tournament_id)
@@ -408,7 +422,24 @@ class TournamentManager:
         for pid in (g.white_id, g.black_id):
             self._load[pid] = self._load.get(pid, 0) + 1
         self._game_tournament[g.id] = tournament_id
-        self._games[g.id] = asyncio.create_task(self._run_game(g, tournament_id), name=f"game-{g.id}")
+        task = asyncio.create_task(self._run_game(g, tournament_id), name=f"game-{g.id}")
+        self._games[g.id] = task
+        # Release bookkeeping in a done-callback, not in _run_game's ``finally``: a task cancelled
+        # before its first step (e.g. shutdown right after play_single) never runs its body, which
+        # would leak the per-player load and the _games entry (tournament then never finishes).
+        task.add_done_callback(lambda _t, g=g, tid=tournament_id: self._release(g, tid))
+
+    def _release(self, g: GameRecord, tournament_id: Optional[str]) -> None:
+        self._games.pop(g.id, None)
+        self._game_tournament.pop(g.id, None)
+        for pid in (g.white_id, g.black_id):
+            self._load[pid] = max(0, self._load.get(pid, 0) - 1)
+        self._wake_all()
+        if tournament_id:
+            try:
+                self._publish_tournament(tournament_id)
+            except Exception:
+                log.exception("publish failed")
 
     # ------------------------------------------------------------ game execution
     async def _make_player(self, spec: Optional[PlayerSpec]) -> Player:
@@ -420,50 +451,39 @@ class TournamentManager:
         return p
 
     async def _run_game(self, g: GameRecord, tournament_id: Optional[str]) -> None:
-        try:
-            specs = {pid: self.db.get_player(pid) for pid in (g.white_id, g.black_id)}
-            players: dict[str, Optional[Player]] = {}
-            errors: dict[str, str] = {}
-            for pid in (g.white_id, g.black_id):
-                try:
-                    players[pid] = await self._make_player(specs[pid])
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    log.warning("could not create player %s for game %s: %s", pid, g.id, e)
-                    players[pid] = None
-                    errors[pid] = f"{type(e).__name__}: {e}"
-            if errors:
-                for p in players.values():
-                    if p is not None:
-                        try:
-                            await p.close()
-                        except Exception:
-                            log.exception("error closing player")
-                self._forfeit_setup(g, errors)
-                return
-            names = {pid: (s.name if s else pid) for pid, s in specs.items()}
+        # Bookkeeping (load, _games) is released by the task's done-callback (see _launch).
+        specs = {pid: self.db.get_player(pid) for pid in (g.white_id, g.black_id)}
+        players: dict[str, Optional[Player]] = {}
+        errors: dict[str, str] = {}
+        for pid in (g.white_id, g.black_id):
             try:
-                rec = await self._runner()(g, players[g.white_id], players[g.black_id],
-                                           db=self.db, bus=self.bus, names=names)
-                if isinstance(rec, GameRecord) and rec.status in (GameStatus.FINISHED, GameStatus.ABORTED):
-                    self.db.update_game(rec)
+                players[pid] = await self._make_player(specs[pid])
             except asyncio.CancelledError:
                 raise
             except Exception as e:
-                log.exception("game %s crashed", g.id)
-                self._mark_crashed(g, e)
-        finally:
-            self._games.pop(g.id, None)
-            self._game_tournament.pop(g.id, None)
-            for pid in (g.white_id, g.black_id):
-                self._load[pid] = max(0, self._load.get(pid, 0) - 1)
-            self._wake_all()
-            if tournament_id:
-                try:
-                    self._publish_tournament(tournament_id)
-                except Exception:
-                    log.exception("publish failed")
+                log.warning("could not create player %s for game %s: %s", pid, g.id, e)
+                players[pid] = None
+                errors[pid] = f"{type(e).__name__}: {e}"
+        if errors:
+            for p in players.values():
+                if p is not None:
+                    try:
+                        await p.close()
+                    except Exception:
+                        log.exception("error closing player")
+            self._forfeit_setup(g, errors)
+            return
+        names = {pid: (s.name if s else pid) for pid, s in specs.items()}
+        try:
+            rec = await self._runner()(g, players[g.white_id], players[g.black_id],
+                                       db=self.db, bus=self.bus, names=names)
+            if isinstance(rec, GameRecord) and rec.status in (GameStatus.FINISHED, GameStatus.ABORTED):
+                self.db.update_game(rec)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.exception("game %s crashed", g.id)
+            self._mark_crashed(g, e)
 
     def _finish(self, g: GameRecord, result: Optional[str], termination: Termination, detail: str) -> None:
         g.status = GameStatus.FINISHED if result else GameStatus.ABORTED

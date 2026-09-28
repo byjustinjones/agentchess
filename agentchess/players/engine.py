@@ -20,7 +20,7 @@ import chess
 import chess.engine
 
 from agentchess.models import MoveRequest, MoveResponse, PlayerSpec
-from agentchess.players.base import GameStart, Player
+from agentchess.players.base import GameStart, InfrastructureError, Player
 
 log = logging.getLogger(__name__)
 
@@ -118,11 +118,11 @@ class EnginePlayer(Player):
                 return self._engine
             path = self.path or find_stockfish()
             if not path:
-                raise RuntimeError("Stockfish not found: install it, set $STOCKFISH_PATH, or set config.path")
+                raise InfrastructureError("Stockfish not found: install it, set $STOCKFISH_PATH, or set config.path")
             try:
                 transport, engine = await chess.engine.popen_uci(path)
             except (OSError, chess.engine.EngineError) as e:
-                raise RuntimeError(f"could not start engine {path!r}: {e}") from e
+                raise InfrastructureError(f"could not start engine {path!r}: {e}") from e
             self._transport, self._engine = transport, engine
             try:
                 await engine.configure(self._build_options(engine))
@@ -157,11 +157,11 @@ class EnginePlayer(Player):
                                        info=chess.engine.INFO_BASIC | chess.engine.INFO_SCORE)
         except (chess.engine.EngineTerminatedError, chess.engine.EngineError) as e:
             await self._shutdown()
-            raise RuntimeError(f"engine failure: {e}") from e
+            raise InfrastructureError(f"engine failure: {e}") from e
         if result.resigned:
             return MoveResponse(resign=True, comment="engine resigned")
         if result.move is None:
-            raise RuntimeError("engine returned no move")
+            raise InfrastructureError("engine returned no move")
         return MoveResponse(move=result.move.uci(), comment=_describe(result.info, board.turn),
                             usage=_usage(result.info))
 

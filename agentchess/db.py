@@ -408,6 +408,18 @@ class Database:
                         (GameStatus.ABORTED.value, Termination.ABORTED.value, now(), r["id"]))
         return [r["id"] for r in rows]
 
+    def reschedule_aborted(self, tournament_id: str) -> int:
+        """Reset a tournament's ABORTED games to SCHEDULED (moves wiped). Returns how many."""
+        rows = self._all("SELECT id FROM games WHERE tournament_id=? AND status=?",
+                         (tournament_id, GameStatus.ABORTED.value))
+        with self.transaction():
+            for r in rows:
+                self._conn.execute("DELETE FROM moves WHERE game_id=?", (r["id"],))
+                self._conn.execute(
+                    "UPDATE games SET status=?, result=NULL, termination=NULL, termination_detail=NULL, pgn=NULL,"
+                    " started_at=NULL, finished_at=NULL WHERE id=?", (GameStatus.SCHEDULED.value, r["id"]))
+        return len(rows)
+
     def rated_results(self, tournament_id: Optional[str] = None) -> list[dict[str, Any]]:
         """Finished, decided games for rating: [{white_id, black_id, result, termination, tournament_id, finished_at}]."""
         sql = ("SELECT id, white_id, black_id, result, termination, tournament_id, finished_at FROM games"

@@ -450,3 +450,37 @@ async def test_shutdown_aborts_adhoc_games():
     await until(lambda: db.get_game(g.id).status == GameStatus.RUNNING)
     await m.shutdown()
     assert db.get_game(g.id).status == GameStatus.ABORTED
+
+
+async def test_shutdown_before_game_task_starts_releases_capacity():
+    """A game task cancelled before its first step must still release player load and its
+    _games entry; otherwise the players stay 'busy' and later tournaments never finish."""
+    db = make_db(ids=("a", "b"), cap=1)
+    m = manager(db, FakeRunner())
+    g = await m.play_single("a", "b", GameConfig())
+    await m.shutdown()   # no await point between launching and cancelling the game task
+    assert m.player_load("a") == m.player_load("b") == 0
+    assert m.running_game_ids() == []
+    assert db.get_game(g.id, include_moves=False).status == GameStatus.ABORTED
+    t = m.create("T", TournamentConfig(player_ids=["a", "b"], games_per_pair=2, openings="none"))
+    await m.start(t.id)
+    await asyncio.wait_for(m.wait_idle(t.id), 5)
+    assert db.get_tournament(t.id).status == TournamentStatus.FINISHED
+
+
+async def test_retry_aborted_reopens_cancelled_tournament():
+    db = make_db()
+    gate = asyncio.Event()
+    runner = FakeRunner(gate=gate)
+    m = manager(db, runner)
+    t = m.create("r", TournamentConfig(player_ids=list("abcd"), concurrency=2, openings="none"))
+    await m.start(t.id)
+    await until(lambda: len(m.running_game_ids()) == 2)
+    await m.cancel(t.id)
+    assert statuses(db, t.id) == Counter({GameStatus.ABORTED: 12})
+    gate.set()
+    assert await m.retry_aborted(t.id) == 12
+    await asyncio.wait_for(m.wait_idle(t.id), 10)
+    assert db.get_tournament(t.id).status == TournamentStatus.FINISHED
+    assert statuses(db, t.id) == Counter({GameStatus.FINISHED: 12})
+    assert await m.retry_aborted(t.id) == 0

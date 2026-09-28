@@ -28,7 +28,7 @@ from agentchess.models import (
     now,
 )
 from agentchess.moves import parse_move, render_ascii
-from agentchess.players.base import GameEnd, GameStart, Player
+from agentchess.players.base import GameEnd, GameStart, InfrastructureError, Player
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +50,12 @@ def _loss(color: chess.Color) -> str:
 
 def _forfeit(color: chess.Color, termination: Termination, detail: str) -> _GameOver:
     return _GameOver(_loss(color), termination, f"{_COLOR[color]}: {detail}")
+
+
+def _raise_if_infrastructure(color: chess.Color, exc: BaseException) -> None:
+    """Infrastructure failures abort the game (unrated) instead of forfeiting it."""
+    if isinstance(exc, InfrastructureError):
+        raise _GameOver("*", Termination.ABORTED, f"{_COLOR[color]}: infrastructure failure: {exc}")
 
 
 # --------------------------------------------------------------- adjudication
@@ -272,6 +278,7 @@ class _Runner:
                 raise _forfeit(color, Termination.TIMEOUT,
                                f"no move within {self.config.move_timeout_s:g}s (ply {req.ply})")
             if status == "error":
+                _raise_if_infrastructure(color, value)
                 raise _forfeit(color, Termination.ERROR, f"{type(value).__name__}: {value}")
             resp = value
             if not isinstance(resp, MoveResponse):
@@ -281,14 +288,18 @@ class _Runner:
                 _add_usage(usage_total, resp.usage)
                 if resp.resign:
                     raise _forfeit(color, Termination.RESIGNATION, "resigned")
-                move_text = resp.move or ""
+                move_text = resp.move if isinstance(resp.move, str) else str(resp.move or "")
                 try:
                     move = parse_move(self.board, move_text)
                 except ValueError as e:
                     error = str(e)
                 else:
+                    # Untrusted (e.g. a remote agent's WS JSON): a non-string comment must not
+                    # crash persistence and turn the game into an unrated ABORTED one.
+                    comment = resp.comment if resp.comment is None or isinstance(resp.comment, str) \
+                        else str(resp.comment)
                     self._record(move, color, elapsed, time.monotonic() - t_start, attempts,
-                                 resp.comment, usage_total)
+                                 comment, usage_total)
                     return
             attempts.append(MoveAttempt(move=move_text[:200], error=error, elapsed_s=round(elapsed, 3)))
             self.publish({"type": "illegal_move", "game_id": self.game.id, "player_id": pid,
@@ -308,6 +319,7 @@ class _Runner:
             if status == "timeout":
                 raise _forfeit(color, Termination.TIMEOUT, "start_game timed out")
             if status == "error":
+                _raise_if_infrastructure(color, value)
                 raise _forfeit(color, Termination.ERROR, f"start_game failed: {type(value).__name__}: {value}")
 
     async def play(self) -> _GameOver:
@@ -343,7 +355,9 @@ class _Runner:
 
 def _add_usage(total: dict[str, Any], usage: Optional[dict[str, Any]]) -> None:
     """Accumulate numeric usage over attempts (tokens/cost of illegal answers count too)."""
-    for k, v in (usage or {}).items():
+    if not isinstance(usage, dict):
+        return
+    for k, v in usage.items():
         if isinstance(v, (int, float)) and not isinstance(v, bool) and isinstance(total.get(k, 0), (int, float)):
             total[k] = total.get(k, 0) + v
         else:
@@ -386,7 +400,7 @@ async def play_game(
             except asyncio.CancelledError:
                 pass
             raise
-        game.status = GameStatus.FINISHED
+        game.status = GameStatus.ABORTED if over.termination == Termination.ABORTED else GameStatus.FINISHED
         game.result = over.result
         game.termination = over.termination
         game.termination_detail = over.detail

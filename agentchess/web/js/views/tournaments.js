@@ -65,6 +65,7 @@ export const tournamentNewView = {
     let alive = true;
     let players = [];
     let presets = [];
+    const registered = new Map(); // preset id -> id of the player registered for it
     render(root, html`
       <div class="page-head">
         <div><p class="crumbs"><a href="#/tournaments">Tournaments</a></p><h1>New tournament</h1></div>
@@ -224,22 +225,27 @@ export const tournamentNewView = {
       btn.textContent = "Creating…";
       try {
         // Register any selected presets first.
+        // The server may assign a different id (e.g. "sf-1500-2" when an inactive "sf-1500"
+        // exists), so map every selected/candidate id to the id actually registered.
         const presetIds = new Set(presets.map((p) => p.id));
-        for (const id of sel.filter((i) => presetIds.has(i))) {
+        for (const id of sel.filter((i) => presetIds.has(i) && !registered.has(i))) {
           const p = presets.find((x) => x.id === id);
           const body = { id: p.id, name: p.name, kind: p.kind, config: p.config || {} };
           if (p.anchor_elo != null) body.anchor_elo = p.anchor_elo;
           if (p.max_concurrent_games != null) body.max_concurrent_games = p.max_concurrent_games;
-          await post("players", body);
+          const res = await post("players", body);
+          const newId = (res && res.player && res.player.id) || id;
+          registered.set(id, newId); // a retry after a failed submit must not register it again
         }
+        const realId = (i) => registered.get(i) || i;
         const num = (v, d) => (v === "" || Number.isNaN(Number(v)) ? d : Number(v));
         const body = {
           name: form.name.value.trim(),
           start: form.start.checked,
           config: {
-            player_ids: sel,
+            player_ids: sel.map(realId),
             format: form.format.value,
-            candidate_ids: form.format.value === "gauntlet" ? cands : [],
+            candidate_ids: form.format.value === "gauntlet" ? cands.map(realId) : [],
             games_per_pair: gpp,
             openings: form.openings.value,
             concurrency: num(form.concurrency.value, 4),
@@ -312,6 +318,7 @@ export const tournamentDetailView = {
 
     function actions(status) {
       const b = [];
+      if (status !== "running" && t && t.progress && t.progress.aborted > 0) b.push(html`<button type="button" class="btn" data-t="retry-aborted" title="Replay games aborted by provider/engine failures or a cancel">Retry ${t.progress.aborted} aborted</button>`);
       if (status === "pending" || status === "paused") b.push(html`<button type="button" class="btn btn-primary" data-t="start">${status === "paused" ? "Resume" : "Start"}</button>`);
       if (status === "running") b.push(html`<button type="button" class="btn" data-t="pause">Pause</button>`);
       if (["pending", "running", "paused"].includes(status)) b.push(html`<button type="button" class="btn btn-danger-outline" data-t="cancel">Cancel</button>`);
@@ -436,7 +443,7 @@ export const tournamentDetailView = {
           return;
         }
         await post(`tournaments/${enc(tid)}/${act}`);
-        toast(`Tournament ${act === "start" ? "started" : act === "pause" ? "paused" : "cancelled"}`, "ok");
+        toast({ start: "Tournament started", pause: "Tournament paused", cancel: "Tournament cancelled", "retry-aborted": "Aborted games rescheduled" }[act] || "Done", "ok");
         await load();
       } catch (err) {
         render(root.querySelector("#td-error"), errorBanner(err));

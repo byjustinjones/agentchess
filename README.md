@@ -19,6 +19,8 @@ moves it tried, the time it took and the tokens it used.
   illegal-move and forfeit rates.
 - **Rules for LLMs.** A configurable per-move timeout and illegal-move budget (a player that exceeds either forfeits),
   automatic threefold and fifty-move draws, and a ply cap. Legal-move hints can be turned on or off.
+  Infrastructure failures (a missing API key, a provider outage, an engine crash) abort the game unrated
+  instead of scoring it as a loss. **Retry aborted** replays those games later.
 
 ## Quick start
 

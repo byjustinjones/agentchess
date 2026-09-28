@@ -455,6 +455,11 @@ def build_api_router() -> APIRouter:
     async def cancel_tournament(tournament_id: str, request: Request) -> dict[str, Any]:
         return await _action(request, tournament_id, "cancel")
 
+    @api.post("/tournaments/{tournament_id}/retry-aborted")
+    async def retry_aborted(tournament_id: str, request: Request) -> dict[str, Any]:
+        """Replay games aborted by infrastructure failures or a cancel."""
+        return await _action(request, tournament_id, "retry_aborted")
+
     @api.delete("/tournaments/{tournament_id}")
     async def delete_tournament(tournament_id: str, request: Request) -> dict[str, Any]:
         s = st(request)

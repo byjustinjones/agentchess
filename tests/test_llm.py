@@ -9,6 +9,7 @@ import pytest
 from agentchess.game import play_game
 from agentchess.models import GameConfig, GameRecord, MoveRequest, PlayerKind, PlayerSpec, Termination
 from agentchess.moves import render_ascii
+from agentchess.players.base import InfrastructureError
 from agentchess.players.llm import DEFAULT_SYSTEM_PROMPT, LLMConfig, LLMPlayer, build_prompt, trim_comment
 
 try:  # anthropic>=1.0 is built on httpx2
@@ -165,6 +166,19 @@ async def test_anthropic_streams_for_large_max_tokens_and_fallback_parse():
     assert resp.move == "e2e4"  # found by scanning, no MOVE: line
 
 
+async def test_truncated_reply_is_not_scanned_for_a_move():
+    """A reply cut off by max_tokens has no final answer; the fallback scan must not pick a
+    move mentioned mid-reasoning (the runner re-asks instead)."""
+    cut = message("Candidates: d4 is solid, but after e4 e5 Nf3 the line", stop_reason="max_tokens")
+    player = LLMPlayer(llm_spec(), anthropic_client=FakeAnthropic([cut]))
+    resp = await player.get_move(make_request())
+    assert resp.move == "" and "truncated" in resp.comment
+    # an explicit MOVE: line is still honoured even if the reply was cut afterwards
+    cut = message("MOVE: e4\nand now some trailing tex", stop_reason="max_tokens")
+    player = LLMPlayer(llm_spec(), anthropic_client=FakeAnthropic([cut]))
+    assert (await player.get_move(make_request())).move == "e4"
+
+
 async def test_anthropic_refusal():
     refused = message("", stop_reason="refusal",
                       stop_details=SimpleNamespace(type="refusal", category="cyber", explanation=None))
@@ -185,18 +199,18 @@ async def test_anthropic_retries_transient_errors():
 
     bad = anthropic.BadRequestError("bad", response=sdk_httpx.Response(400, request=request), body=None)
     player = LLMPlayer(llm_spec(retry_base_delay_s=0), anthropic_client=FakeAnthropic([bad]))
-    with pytest.raises(anthropic.BadRequestError):
+    with pytest.raises(InfrastructureError, match="HTTP 400"):
         await player.get_move(make_request())
 
     player = LLMPlayer(llm_spec(retry_base_delay_s=0), anthropic_client=FakeAnthropic([conn] * 4))
-    with pytest.raises(RuntimeError, match="after 4 attempts"):
+    with pytest.raises(InfrastructureError, match="after 4 attempts"):
         await player.get_move(make_request())
 
 
 async def test_missing_api_key(monkeypatch):
     monkeypatch.delenv("AGENTCHESS_TEST_KEY", raising=False)
     player = LLMPlayer(llm_spec(api_key_env="AGENTCHESS_TEST_KEY"))
-    with pytest.raises(RuntimeError, match="AGENTCHESS_TEST_KEY"):
+    with pytest.raises(InfrastructureError, match="AGENTCHESS_TEST_KEY"):
         await player.get_move(make_request())
 
 

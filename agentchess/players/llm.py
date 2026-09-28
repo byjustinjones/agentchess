@@ -25,7 +25,7 @@ import httpx
 
 from agentchess.models import MoveRequest, MoveResponse, PlayerSpec
 from agentchess.moves import extract_move_text, find_move_in_text, render_ascii
-from agentchess.players.base import Player
+from agentchess.players.base import InfrastructureError, Player
 
 log = logging.getLogger(__name__)
 
@@ -194,11 +194,14 @@ class LLMPlayer(Player):
             return MoveResponse(move="", comment=trim_comment(comment), usage=usage)
 
         move = extract_move_text(reply.text)
-        if move is None and self.config.fallback_parse:
+        truncated = reply.stop_reason in ("max_tokens", "length", "model_context_window_exceeded")
+        # A reply cut off mid-reasoning has no final answer: scanning it would play whatever
+        # move the model happened to mention last (a candidate, an opponent reply...).
+        if move is None and self.config.fallback_parse and not truncated:
             found = find_move_in_text(chess.Board(request.fen), reply.text)
             move = found.uci() if found else None
         comment = reply.text
-        if reply.stop_reason in ("max_tokens", "length"):
+        if truncated:
             comment += f"\n[reply truncated: {reply.stop_reason}]"
         return MoveResponse(move=move or "", comment=trim_comment(comment), usage=usage)
 
@@ -223,7 +226,7 @@ class LLMPlayer(Player):
             except TransientError as e:
                 if attempt >= self.config.max_retries:
                     cause = e.__cause__ or e
-                    raise RuntimeError(f"{self.config.provider} API error after {attempt + 1} attempts: {cause}") from cause
+                    raise InfrastructureError(f"{self.config.provider} API error after {attempt + 1} attempts: {cause}") from cause
                 retry_after = e.retry_after
                 delay = self.config.retry_base_delay_s * (2 ** attempt) * (1 + random.random() * 0.25)
                 if retry_after:
@@ -238,7 +241,7 @@ class LLMPlayer(Player):
         if self._anthropic is None:
             key = os.environ.get(self.config.api_key_env)
             if not key:
-                raise RuntimeError(f"environment variable {self.config.api_key_env} is not set")
+                raise InfrastructureError(f"environment variable {self.config.api_key_env} is not set")
             self._anthropic = anthropic.AsyncAnthropic(api_key=key, max_retries=0,
                                                        timeout=self.config.request_timeout_s)
             self._owned.append(self._anthropic)
@@ -269,7 +272,8 @@ class LLMPlayer(Player):
             if e.status_code in TRANSIENT_STATUS or e.status_code >= 500:
                 headers = e.response.headers if e.response is not None else None
                 raise TransientError(f"HTTP {e.status_code}: {e.message}", _retry_after(headers)) from e
-            raise
+            # 400/401/403/404...: bad key, unknown model or rejected parameters — a setup problem.
+            raise InfrastructureError(f"anthropic HTTP {e.status_code}: {e.message}") from e
 
         text = "".join(getattr(b, "text", "") for b in msg.content if getattr(b, "type", None) == "text")
         usage = getattr(msg, "usage", None)
@@ -315,12 +319,12 @@ class LLMPlayer(Player):
         if resp.status_code in TRANSIENT_STATUS or resp.status_code >= 500:
             raise TransientError(f"HTTP {resp.status_code}: {resp.text[:300]}", _retry_after(resp.headers))
         if resp.status_code >= 400:
-            raise RuntimeError(f"HTTP {resp.status_code} from {url}: {resp.text[:500]}")
+            raise InfrastructureError(f"HTTP {resp.status_code} from {url}: {resp.text[:500]}")
         try:
             data = resp.json()
             choice = data["choices"][0]
         except (ValueError, KeyError, IndexError, TypeError) as e:
-            raise RuntimeError(f"unexpected response from {url}: {resp.text[:500]}") from e
+            raise InfrastructureError(f"unexpected response from {url}: {resp.text[:500]}") from e
 
         message = choice.get("message") or {}
         content = message.get("content")

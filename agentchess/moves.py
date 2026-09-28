@@ -16,7 +16,10 @@ _UCI_RE = re.compile(r"^[a-h][1-8][a-h][1-8][qrbn]?$", re.IGNORECASE)
 _MOVE_NUMBER_RE = re.compile(r"^\d+\s*\.+\s*")
 _STRIP_CHARS = " \t\r\n\"'`*_()[]{}<>"
 _TRAILING_CHARS = ".,;:!?"
-_MOVE_LINE_RE = re.compile(r"MOVE\s*[*_]*\s*:\s*(.*)$", re.IGNORECASE)
+# "MOVE:" marker: any case at the start of a line (after markdown decoration), or
+# anywhere in the line when written in capitals ("Final answer -> MOVE: e4"). A
+# lowercase mid-sentence "move:" ("White's last move: e4") is prose, not an answer.
+_MOVE_LINE_RE = re.compile(r"(?:^[\s>*_#`-]*(?i:move)|MOVE)\s*[*_]*\s*:\s*(.*)$")
 _TOKEN_SPLIT_RE = re.compile(r"[\s,;()\[\]{}\"'`*]+")
 # Cheap pre-filter for tokens that could be a move (avoids parsing every word).
 _MOVE_LIKE_RE = re.compile(

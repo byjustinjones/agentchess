@@ -131,6 +131,8 @@ async def play_game(
   `asyncio.wait_for(..., config.move_timeout_s)`. Timeout → loss (`TIMEOUT`); exception → loss (`ERROR`);
   `resign` → loss (`RESIGNATION`); unparseable/illegal → record `MoveAttempt`, retry with
   `attempt+1` and `previous_error`, loss (`ILLEGAL_MOVES`) after `max_illegal_attempts` bad answers on one move.
+- A player raising `players.base.InfrastructureError` (missing API key, provider outage after retries,
+  rejected config, engine crash) ends the game as ABORTED with result `*` — unrated, never a forfeit.
 - Game end: checkmate, stalemate, insufficient material, **automatic** claim of threefold
   repetition and fifty-move rule (`board.can_claim_draw()` style — use `is_repetition(3)` / `is_fifty_moves()`),
   and `max_plies` → draw (`MAX_PLIES`). Also fivefold/75-move via `board.outcome()`.
@@ -222,6 +224,7 @@ All under `/api`. Errors: HTTP 4xx with `{"detail": "..."}`.
 | POST `/api/tournaments` | `{name, config: TournamentConfig dict, start?: bool}` | tournament + progress |
 | GET `/api/tournaments/{id}` | | tournament + progress + `{"standings": [RatingRow], "crosstable": {...}, "players":[PlayerSpec]}` |
 | POST `/api/tournaments/{id}/start` / `pause` / `cancel` | | tournament |
+| POST `/api/tournaments/{id}/retry-aborted` | | tournament — reschedules ABORTED games (infra failures, cancel) and runs them |
 | DELETE `/api/tournaments/{id}` | | `{"deleted": true}` (not while running) |
 | GET `/api/games` | `?tournament_id&status&player_id&limit&offset&order=seq|recent` | `{"games":[GameRecord.to_dict(False) + white_name/black_name], "total": n}` |
 | POST `/api/games` | `{white_id, black_id, config?: GameConfig, opening_id?}` | game (ad-hoc exhibition) |

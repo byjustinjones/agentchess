@@ -83,6 +83,8 @@ def test_extract_move_text():
     assert extract_move_text("MOVE: 12... Nf6") == "Nf6"
     assert extract_move_text("Final answer -> MOVE: exd5") == "exd5"
     assert extract_move_text("I play e4") is None
+    assert extract_move_text("After White's last move: e4, I consider Nf6") is None
+    assert extract_move_text("- move: Nc6") == "Nc6"
     assert extract_move_text("") is None
     assert extract_move_text("MOVE:\nMOVE: ") is None
 

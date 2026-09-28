@@ -8,6 +8,13 @@ from typing import Any, Optional
 from agentchess.models import MoveRequest, MoveResponse, PlayerSpec
 
 
+class InfrastructureError(RuntimeError):
+    """A failure outside the player's control: missing API key, provider outage after
+    retries, rejected configuration, engine binary crash. The game runner aborts the
+    game (unrated) instead of scoring it as a forfeit, so a misconfigured participant
+    doesn't hand free wins to its opponents."""
+
+
 @dataclass
 class GameStart:
     game_id: str
