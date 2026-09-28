@@ -79,6 +79,7 @@ class Runtime:
         self.hub = AgentHub(self.bus)
         self.ctx = PlayerContext(agent_hub=self.hub)
         self.manager = TournamentManager(db, self.bus, self.ctx)
+        self._sweeper: Optional[asyncio.Task] = None
 
     @classmethod
     def open(cls, db_path: str, seed: bool = False) -> "Runtime":
@@ -97,8 +98,20 @@ class Runtime:
             await self.manager.resume_all()
         else:
             self.db.recover_interrupted_games()
+        self._sweeper = asyncio.create_task(self._sweep_agents())
+
+    async def _sweep_agents(self, interval_s: float = 15.0) -> None:
+        """Periodically re-check agent presence so silent agents are reported offline."""
+        while True:
+            await asyncio.sleep(interval_s)
+            try:
+                self.hub.sweep()
+            except Exception:  # pragma: no cover
+                log.exception("agent sweep failed")
 
     async def stop(self) -> None:
+        if self._sweeper:
+            self._sweeper.cancel()
         try:
             await self.manager.shutdown()
         finally:
