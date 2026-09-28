@@ -5,7 +5,7 @@ import { Subscriptions } from "../ws.js";
 
 /** Code block with a copy button. */
 export function codeBlock(code, label = "") {
-  return html`<div class="code-block">${label ? html`<div class="code-label">${label}</div>` : ""}<button type="button" class="btn btn-sm code-copy" data-copy>Copy</button><pre><code>${code}</code></pre></div>`;
+  return html`<div class="code-block">${label ? html`<div class="code-label">${label}</div>` : ""}<div class="code-wrap"><button type="button" class="btn btn-sm code-copy" data-copy>Copy</button><pre><code>${code}</code></pre></div></div>`;
 }
 
 /** Wire up [data-copy] buttons inside `root` (copies the sibling <pre>). */
