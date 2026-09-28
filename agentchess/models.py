@@ -182,6 +182,7 @@ class GameRecord:
     created_at: float = field(default_factory=now)
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
+    ply_count: Optional[int] = None         # set by list queries that don't load moves
 
     def to_dict(self, include_moves: bool = True) -> dict[str, Any]:
         d = {
@@ -201,7 +202,7 @@ class GameRecord:
             "created_at": self.created_at,
             "started_at": self.started_at,
             "finished_at": self.finished_at,
-            "ply_count": len(self.moves),
+            "ply_count": len(self.moves) if self.moves or self.ply_count is None else self.ply_count,
         }
         if include_moves:
             d["moves"] = [m.to_dict() for m in self.moves]

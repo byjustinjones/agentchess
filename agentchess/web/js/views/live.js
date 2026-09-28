@@ -48,9 +48,9 @@ export default {
       card.dataset.game = g.id;
       render(card, html`
         <a class="live-link" href="#/game/${enc(g.id)}" aria-label="Watch ${st.whiteName} vs ${st.blackName}">
-          <div class="live-player" data-side="black"><span class="side-dot black" aria-hidden="true"></span><span class="pname">${st.blackName}</span><span class="thinking" hidden><span class="pulse" aria-hidden="true"></span>thinking… <span class="secs"></span></span></div>
+          <div class="live-player" data-side="black"><span class="side-dot black" aria-hidden="true"></span><span class="pname">${st.blackName}</span><span class="thinking" hidden><span class="pulse" aria-hidden="true"></span><span class="t-word">thinking…</span> <span class="secs"></span></span></div>
           <div class="live-board"></div>
-          <div class="live-player" data-side="white"><span class="side-dot white" aria-hidden="true"></span><span class="pname">${st.whiteName}</span><span class="thinking" hidden><span class="pulse" aria-hidden="true"></span>thinking… <span class="secs"></span></span></div>
+          <div class="live-player" data-side="white"><span class="side-dot white" aria-hidden="true"></span><span class="pname">${st.whiteName}</span><span class="thinking" hidden><span class="pulse" aria-hidden="true"></span><span class="t-word">thinking…</span> <span class="secs"></span></span></div>
           <div class="live-meta"><span class="live-move"></span><span class="live-last"></span></div>
           <div class="live-sub muted">${g.opening ? g.opening.name : "Start position"}${g.tournament_id ? " · tournament" : " · exhibition"}</div>
           <div class="live-flash" role="status" hidden></div>

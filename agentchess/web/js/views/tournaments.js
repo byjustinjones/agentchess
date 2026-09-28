@@ -123,11 +123,11 @@ export const tournamentNewView = {
         <h2 class="form-h">Format</h2>
         <div class="form-grid">
           <label class="field"><span>Format</span>
-            <select name="format"><option value="round_robin">Round robin (everyone plays everyone)</option><option value="gauntlet">Gauntlet (candidates vs the field)</option></select>
+            <select name="format"><option value="round_robin">Round robin</option><option value="gauntlet">Gauntlet</option></select>
           </label>
           <label class="field"><span>Games per pair</span><input name="games_per_pair" type="number" min="1" max="100" value="2" required></label>
           <label class="field"><span>Openings</span>
-            <select name="openings"><option value="builtin">Built-in balanced suite</option><option value="none">None (start position)</option></select>
+            <select name="openings"><option value="builtin">Built-in suite</option><option value="none">None (start position)</option></select>
           </label>
           <label class="field"><span>Concurrency <small class="muted">(games at once)</small></span><input name="concurrency" type="number" min="1" max="64" value="4"></label>
           <label class="field"><span>Seed</span><input name="seed" type="number" value="0"></label>

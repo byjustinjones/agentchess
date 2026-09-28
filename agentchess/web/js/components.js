@@ -89,6 +89,17 @@ export function standingsTable(rows, stats = {}, { compact = false } = {}) {
 
 const KIND_ORDER = ["engine", "llm", "remote", "random"];
 
+let measureCtx = null;
+/** Pixel width of a chart label (12.5px UI font). */
+function measureText(s) {
+  if (!measureCtx) {
+    measureCtx = document.createElement("canvas").getContext("2d");
+    const family = getComputedStyle(document.body).fontFamily || "sans-serif";
+    measureCtx.font = `12.5px ${family}`;
+  }
+  return measureCtx.measureText(s).width;
+}
+
 /** Horizontal Elo ± CI chart (SVG) sized to `width` px. */
 export function ciChartSvg(rows, width) {
   if (!rows || !rows.length) return "";
@@ -109,8 +120,17 @@ export function ciChartSvg(rows, width) {
   lo = Math.floor(lo / step) * step;
   hi = Math.ceil(hi / step) * step;
   const x = (v) => labelW + ((v - lo) / (hi - lo)) * plotW;
-  const maxChars = Math.floor(labelW / 7.2);
-  const trunc = (s) => (s.length > maxChars ? `${s.slice(0, maxChars - 1)}…` : s);
+  const maxW = labelW - 16;
+  const trunc = (s) => {
+    if (measureText(s) <= maxW) return s;
+    let lo2 = 0;
+    let hi2 = s.length;
+    while (lo2 < hi2) {
+      const mid = Math.ceil((lo2 + hi2) / 2);
+      if (measureText(`${s.slice(0, mid)}…`) <= maxW) lo2 = mid; else hi2 = mid - 1;
+    }
+    return `${s.slice(0, lo2)}…`;
+  };
 
   const parts = [];
   for (let v = lo; v <= hi + 1e-9; v += step) {
@@ -187,7 +207,7 @@ export function progressBar(p) {
   const pct = (n) => (total ? (n / total) * 100 : 0).toFixed(2);
   const done = fin + ab;
   return html`<div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="${total}" aria-valuenow="${done}" aria-label="${done} of ${total} games done">
-      <span class="seg seg-fin" style="width:${pct(fin)}%"></span><span class="seg seg-run" style="width:${pct(run)}%"></span><span class="seg seg-ab" style="width:${pct(ab)}%"></span>
+      <span class="pseg pseg-fin" style="width:${pct(fin)}%"></span><span class="pseg pseg-run" style="width:${pct(run)}%"></span><span class="pseg pseg-ab" style="width:${pct(ab)}%"></span>
     </div>
     <div class="progress-label">${fin}/${total} finished${run ? ` · ${run} running` : ""}${ab ? ` · ${ab} aborted` : ""}</div>`;
 }
@@ -202,6 +222,8 @@ export function resultClass(result, forWhite) {
 /** Table of games. perspective: optional player id to show W/L colouring from their side. */
 export function gamesTable(games, { perspective = null, showRound = false, emptyText = "No games yet." } = {}) {
   if (!games || !games.length) return html`<div class="empty">${emptyText}</div>`;
+  // ply_count is only meaningful when the list endpoint loads moves; hide the column otherwise.
+  const showMoves = games.some((g) => Number(g.ply_count) > 0);
   const rows = games.map((g) => {
     let resCls = "";
     if (perspective && g.result) resCls = resultClass(g.result, g.white_id === perspective);
@@ -216,7 +238,7 @@ export function gamesTable(games, { perspective = null, showRound = false, empty
       </td>
       <td class="num result ${resCls}">${g.status === "finished" || g.result ? fmtResult(g.result) : g.status === "running" ? "…" : ""}</td>
       <td class="muted">${fmtTermination(g.termination)}</td>
-      <td class="num">${moves}</td>
+      ${showMoves ? html`<td class="num">${moves}</td>` : ""}
       <td class="muted opening-cell">${g.opening ? g.opening.name : ""}</td>
       <td class="muted nowrap">${timeAgo(g.finished_at || g.started_at || g.created_at)}</td>
       <td><a class="btn btn-sm" href="#/game/${enc(g.id)}">${g.status === "running" ? "Watch" : "View"}</a></td>
@@ -226,7 +248,7 @@ export function gamesTable(games, { perspective = null, showRound = false, empty
     <thead><tr>
       ${showRound ? html`<th class="num" scope="col">Rd</th>` : ""}
       <th scope="col">Status</th><th scope="col">Players</th><th class="num" scope="col">Result</th>
-      <th scope="col">Termination</th><th class="num" scope="col">Moves</th><th scope="col">Opening</th><th scope="col">When</th><th scope="col"><span class="sr-only">Actions</span></th>
+      <th scope="col">Termination</th>${showMoves ? html`<th class="num" scope="col">Moves</th>` : ""}<th scope="col">Opening</th><th scope="col">When</th><th scope="col"><span class="sr-only">Actions</span></th>
     </tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;

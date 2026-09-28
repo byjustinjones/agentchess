@@ -273,9 +273,9 @@ export default {
       const following = idx >= moves.length;
       const rec = {
         ply: e.ply, color: e.color, uci: e.uci, san: e.san, fen_after: e.fen,
-        elapsed_s: e.elapsed_s, total_elapsed_s: e.elapsed_s,
+        elapsed_s: e.elapsed_s, total_elapsed_s: e.total_elapsed_s ?? e.elapsed_s,
         illegal_attempts: pendingIllegal.length ? pendingIllegal.slice() : [],
-        comment: e.comment, usage: {},
+        comment: e.comment, usage: e.usage || {},
       };
       const at = moves.findIndex((m) => m.ply === e.ply);
       if (at >= 0) moves[at] = { ...moves[at], ...rec }; else moves.push(rec);

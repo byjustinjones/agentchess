@@ -349,10 +349,16 @@ class Database:
             "seq": "created_at, seq",
             "recent": "COALESCE(finished_at, started_at, created_at) DESC",
         }.get(order, "created_at, seq")
-        sql = "SELECT * FROM games" + (" WHERE " + " AND ".join(where) if where else "")
+        sql = ("SELECT games.*, (SELECT COUNT(*) FROM moves WHERE moves.game_id=games.id) AS n_moves FROM games"
+               + (" WHERE " + " AND ".join(where) if where else ""))
         sql += f" ORDER BY {order_sql} LIMIT ? OFFSET ?"
         params += [limit, offset]
-        return [self._row_to_game(r) for r in self._all(sql, params)]
+        out = []
+        for r in self._all(sql, params):
+            g = self._row_to_game(r)
+            g.ply_count = r["n_moves"]
+            out.append(g)
+        return out
 
     def count_games(self, tournament_id: Optional[str] = None, status: Optional[str] = None,
                     player_id: Optional[str] = None) -> int:
