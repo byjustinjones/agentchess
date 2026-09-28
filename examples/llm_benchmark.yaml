@@ -1,0 +1,54 @@
+# LLM benchmark: Claude models vs. an anchored Stockfish ladder.
+#   export ANTHROPIC_API_KEY=...        (and OPENAI_API_KEY / OPENROUTER_API_KEY for the others)
+#   agentchess run examples/llm_benchmark.yaml --serve
+# A gauntlet: every LLM plays every anchor; anchors don't play each other.
+# Remote (external) agents can join too: add a `kind: remote` player, run with --serve and
+# connect with the printed token (see examples/llm_agent.py or examples/claude_code_mcp.md).
+
+players:
+  - id: claude-opus-5-5
+    name: Claude Opus 5.5
+    kind: llm
+    config:
+      provider: anthropic
+      model: claude-opus-5-5
+      effort: high
+      max_tokens: 16000
+      input_cost_per_mtok: 4.0
+      output_cost_per_mtok: 20.0
+    max_concurrent_games: 4
+  - id: claude-sonnet-5-5
+    name: Claude Sonnet 5.5
+    kind: llm
+    config:
+      provider: anthropic
+      model: claude-sonnet-5-5
+      effort: high
+      input_cost_per_mtok: 2.0
+      output_cost_per_mtok: 10.0
+    max_concurrent_games: 4
+  # Any OpenAI-compatible endpoint (OpenAI, OpenRouter, vLLM, Ollama ...):
+  # - id: local-llama
+  #   name: Llama (Ollama)
+  #   kind: llm
+  #   config: {provider: openai, model: "llama3.1:70b", base_url: "http://localhost:11434/v1", api_key_env: OLLAMA_API_KEY}
+  - random
+  - sf-skill0-d1
+  - sf-skill3
+  - sf-1320
+  - sf-1500
+  - sf-1800
+
+tournament:
+  name: LLM benchmark
+  format: gauntlet
+  candidate_ids: [claude-opus-5-5, claude-sonnet-5-5]
+  games_per_pair: 4
+  openings: builtin
+  concurrency: 6
+  wait_for_remote: true
+  game:
+    move_timeout_s: 600         # thinking models can be slow
+    max_illegal_attempts: 3
+    max_plies: 300
+    show_legal_moves: false     # harder: the model must know the rules itself

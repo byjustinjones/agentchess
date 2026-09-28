@@ -1,0 +1,33 @@
+# Headless tournament: `agentchess run examples/tournament.yaml`
+# Runs without any API key: a random mover and three Stockfish levels (needs stockfish installed).
+# Add `--serve` to watch it live in the GUI at http://127.0.0.1:8000.
+
+players:
+  - random              # preset ids (see GET /api/players/presets) ...
+  - sf-skill0-d1
+  - sf-1320             # UCI_Elo levels are rating anchors (anchor_elo = uci_elo)
+  - sf-1500
+  # ... or full player definitions. This one needs ANTHROPIC_API_KEY in the environment:
+  # - id: claude-opus-5-5
+  #   name: Claude Opus 5.5
+  #   kind: llm
+  #   config:
+  #     provider: anthropic
+  #     model: claude-opus-5-5
+  #     effort: high
+  #     input_cost_per_mtok: 4.0
+  #     output_cost_per_mtok: 20.0
+  #   max_concurrent_games: 4
+
+tournament:
+  name: Stockfish ladder smoke test
+  format: round_robin     # or gauntlet (+ candidate_ids)
+  games_per_pair: 2       # even: each opening is played with both colours
+  openings: builtin       # or none
+  concurrency: 4
+  seed: 0
+  game:
+    move_timeout_s: 60
+    max_illegal_attempts: 3
+    max_plies: 300
+    show_legal_moves: true
