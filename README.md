@@ -54,6 +54,11 @@ API keys: copy `.env.example` to `.env` (git-ignored), fill in the keys you need
 `chmod 600 .env`. agentchess loads it automatically, and configs refer to keys only by variable
 name (`api_key_env`), so keys never appear in YAML or the database.
 
+No local machine (tablet, Chromebook)? Open the repo in **GitHub Codespaces**
+(Code → Codespaces → Create codespace on this branch). `.devcontainer/` installs Python,
+Stockfish and agentchess; run `agentchess serve --host 0.0.0.0` and the GUI opens in the
+browser through the forwarded port. Add API keys as Codespaces secrets, not in files.
+
 Headless runs (CI, batch benchmarking):
 
 ```bash

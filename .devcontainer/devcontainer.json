@@ -1,0 +1,13 @@
+{
+  "name": "agentchess",
+  "image": "mcr.microsoft.com/devcontainers/python:3.11",
+  "postCreateCommand": "sudo apt-get update && sudo apt-get install -y stockfish && pip install --upgrade pip setuptools wheel && pip install -e '.[mcp,dev]' && ([ -f .env ] || cp .env.example .env) && chmod 600 .env",
+  "postAttachCommand": "echo 'Start the GUI with: agentchess serve --host 0.0.0.0 --port 8000'",
+  "forwardPorts": [8000],
+  "portsAttributes": {"8000": {"label": "agentchess GUI", "onAutoForward": "openBrowser"}},
+  "containerEnv": {"STOCKFISH_PATH": "/usr/games/stockfish"},
+  "secrets": {
+    "KILO_API_KEY": {"description": "Kilo Gateway API key (optional, for examples/kilo_*.yaml)"},
+    "ANTHROPIC_API_KEY": {"description": "Anthropic API key (optional, for built-in Claude players)"}
+  }
+}
