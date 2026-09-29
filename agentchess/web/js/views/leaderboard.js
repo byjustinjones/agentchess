@@ -27,7 +27,7 @@ export default {
       <div class="page-head">
         <div>
           <h1>Leaderboard</h1>
-          <p class="subtitle">Bradley–Terry Elo with 95% bootstrap confidence intervals. Engine levels anchor the scale.</p>
+          <p class="subtitle">Bradley–Terry Elo with 95% bootstrap confidence intervals; engine levels anchor the scale. ACPL and blunder rates come from post-game Stockfish analysis.</p>
         </div>
         <div class="filters">
           <label class="field-inline">
@@ -97,6 +97,7 @@ export default {
 
     const refresh = debounce(load, 1500);
     subs.on("game_finished", refresh);
+    subs.on("game_analysed", refresh);
     subs.on("tournament_updated", debounce(loadTournaments, 1500));
     subs.on("_reconnect", load);
 

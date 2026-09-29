@@ -20,6 +20,8 @@ from agentchess.players.base import GameEnd, GameStart, Player
 
 _Pending = tuple[MoveRequest, "asyncio.Future[MoveResponse]"]
 
+READY_WINDOW_S = 10.0   # an agent seen this recently may be handed a new game (see AgentHub.is_ready)
+
 
 class AgentHub:
     def __init__(self, bus: Optional[EventBus] = None, max_notifications: int = 100) -> None:
@@ -114,6 +116,13 @@ class AgentHub:
             return True
         seen = self._last_seen.get(player_id)
         return seen is not None and time.time() - seen <= within_s
+
+    def is_ready(self, player_id: str, within_s: float = READY_WINDOW_S) -> bool:
+        """Stricter than :meth:`is_online`, for *starting* a game: the agent must be waiting
+        right now (open WebSocket or an in-flight long-poll) or have talked to us within
+        the last few seconds. A crashed agent otherwise stays "online" for a minute and
+        gets handed a game it will forfeit on time."""
+        return self.is_online(player_id, within_s=within_s)
 
     def pending_requests(self, player_id: str) -> list[MoveRequest]:
         """Unanswered requests for this agent, oldest first."""

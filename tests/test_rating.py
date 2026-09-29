@@ -194,10 +194,14 @@ def test_crosstable():
     res = games("a", "b", 2, 1, 1) + games("a", "c", 1, 0, 0) + [{"white_id": "x", "black_id": "a", "result": "1-0"}]
     ct = crosstable(res, ["a", "b", "c"])
     assert ct["players"] == ["a", "b", "c"]
-    assert ct["cells"]["a"]["b"] == {"w": 2, "d": 1, "l": 1, "score": 2.5, "games": 4}
-    assert ct["cells"]["b"]["a"] == {"w": 1, "d": 1, "l": 2, "score": 1.5, "games": 4}
+    assert ct["cells"]["a"]["b"] == {"w": 2, "d": 1, "l": 1, "score": 2.5, "games": 4, "p": 1.0}
+    assert ct["cells"]["b"]["a"] == {"w": 1, "d": 1, "l": 2, "score": 1.5, "games": 4, "p": 1.0}
     assert ct["cells"]["c"]["a"]["l"] == 1
-    assert ct["cells"]["b"]["c"]["games"] == 0
+    assert ct["cells"]["b"]["c"]["games"] == 0 and ct["cells"]["b"]["c"]["p"] is None
+    # exact two-sided sign test: 5-0 in decisive games -> p = 2 * 0.5**5
+    ct = crosstable(games("a", "b", 5, 3, 0), ["a", "b"])
+    assert ct["cells"]["a"]["b"]["p"] == pytest.approx(2 * 0.5 ** 5)
+    assert ct["cells"]["b"]["a"]["p"] == pytest.approx(2 * 0.5 ** 5)
     assert "a" not in ct["cells"]["a"]
 
 
@@ -209,3 +213,36 @@ def test_sequential_elo():
     assert hist["a"][0]["elo"] == pytest.approx(1500 + 16 * (1 - expected_score(1500, 1800)))
     assert hist["a"][1]["elo"] > hist["a"][0]["elo"]
     assert [h["t"] for h in hist["a"]] == sorted(h["t"] for h in hist["a"])
+
+
+def test_report_extras_linked_opponents_needed_games():
+    from agentchess.rating import rating_report
+
+    # a-b-c chained to anchor x; d-e isolated (no path to an anchor)
+    res = games("a", "b", 6, 2, 2) + games("b", "c", 4, 2, 4) + games("c", "x", 3, 0, 7) + games("d", "e", 5, 0, 5)
+    players = [spec(p) for p in "abcde"] + [spec("x", anchor=1500)]
+    rep = rating_report(res, players, bootstrap=150)
+    rows = by_id(rep.rows)
+    assert rows["a"].linked_to_anchor and rows["c"].linked_to_anchor and rows["x"].linked_to_anchor
+    assert not rows["d"].linked_to_anchor and not rows["e"].linked_to_anchor
+    assert rows["b"].opponents == 2 and rows["a"].opponents == 1 and rows["x"].opponents == 1
+    assert rows["x"].games_for_ci50 is None                      # anchored
+    assert rows["a"].games_for_ci50 and rows["a"].games_for_ci50 > 0   # 10 games: CI far wider than +-50
+    # superiority: antisymmetric, in [0,1], and consistent with the ranking direction
+    for a in rep.superiority:
+        for b, p in rep.superiority[a].items():
+            assert 0.0 <= p <= 1.0 and rep.superiority[b][a] == pytest.approx(1.0 - p)
+    assert rep.superiority["a"]["c"] > 0.5
+    ranked = rep.rows
+    for k, row in enumerate(ranked):
+        if k + 1 < len(ranked):
+            assert row.p_above_next == pytest.approx(rep.superiority[row.player_id][ranked[k + 1].player_id])
+        else:
+            assert row.p_above_next is None
+    assert rows["a"].to_dict()["linked_to_anchor"] is True
+    # without bootstrap the extras degrade gracefully
+    rep0 = rating_report(res, players, bootstrap=0)
+    assert all(r.games_for_ci50 is None for r in rep0.rows)
+    assert rep0.rows[0].p_above_next in (1.0, 0.5)
+    # compute_ratings is the same table
+    assert [r.player_id for r in compute_ratings(res, players, bootstrap=20)] == [r.player_id for r in rep.rows]

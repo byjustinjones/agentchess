@@ -33,8 +33,10 @@ export function standingsTable(rows, stats = {}, { compact = false } = {}) {
     return Number(s.input_tokens) || Number(s.output_tokens);
   });
   const anyCost = rows.some((r) => Number(normStats(stats[r.player_id]).cost_usd));
+  const anyQuality = rows.some((r) => Number(normStats(stats[r.player_id]).judged_moves) > 0);
+  const anyNext = rows.some((r) => r.p_above_next != null);
 
-  const body = rows.map((r) => {
+  const body = rows.map((r, i) => {
     const st = normStats(stats[r.player_id]);
     const moves = Number(st.moves) || 0;
     const illegal = Number(st.illegal_attempts) || 0;
@@ -45,22 +47,33 @@ export function standingsTable(rows, stats = {}, { compact = false } = {}) {
     const dot = ((Number(r.elo) - lo) / span) * 100;
     const tokens = (Number(st.input_tokens) || 0) + (Number(st.output_tokens) || 0);
     const forfeitTitle = `illegal: ${st.forfeit_illegal || 0}, timeout: ${st.forfeit_timeout || 0}, error: ${st.forfeit_error || 0}, resigned: ${st.resigned || 0}`;
+    const ciTitle = `95% CI: ${fmtNum(r.ci_low)} – ${fmtNum(r.ci_high)}`
+      + (r.games_for_ci50 ? ` · about ${fmtNum(r.games_for_ci50)} more games for ±50` : "")
+      + (r.opponents != null ? ` · ${r.opponents} opponent${r.opponents === 1 ? "" : "s"}` : "");
+    const next = rows[i + 1];
+    const nextTitle = next ? `Bootstrap probability that ${r.name || r.player_id} is really stronger than ${next.name || next.player_id}` : "";
+    const judged = Number(st.judged_moves) || 0;
+    const qualityTitle = judged ? `${fmtNum(st.analysed_games)} analysed games, ${fmtNum(judged)} judged moves · mistakes/100: ${fmtNum(st.mistakes_per_100, 1)} · best move ${fmtPct(st.best_move_rate, 0)} · missed wins: ${st.missed_wins || 0}` : "not analysed yet";
     return html`<tr>
       <td class="num rank">${r.rank ?? ""}</td>
       <td class="player-cell">
         <a href="#/player/${enc(r.player_id)}">${r.name || r.player_id}</a>
         ${kindBadge(r.kind)}
         ${r.anchored ? html`<span class="anchor" title="Anchored: rating fixed to the engine's configured Elo">⚓</span>` : ""}
+        ${r.linked_to_anchor === false ? html`<span class="warn-flag" title="No chain of games connects this player to an anchored engine: the rating is only relative to the players it met, not to the Elo scale" role="img" aria-label="not linked to anchors">⚠</span>` : ""}
       </td>
       <td class="num elo"><strong>${fmtNum(r.elo)}</strong></td>
-      <td class="ci-cell" title="95% CI: ${fmtNum(r.ci_low)} – ${fmtNum(r.ci_high)}">
+      <td class="ci-cell" title="${ciTitle}">
         <span class="ci-text">${r.anchored ? "fixed" : raw(`±${esc(fmtNum(hw))}`)}</span>
         <span class="ci-bar" aria-hidden="true"><span class="ci-range" style="left:${left.toFixed(2)}%;width:${width.toFixed(2)}%"></span><span class="ci-dot" style="left:${dot.toFixed(2)}%"></span></span>
       </td>
+      ${anyNext ? html`<td class="num muted" title="${nextTitle}">${r.p_above_next == null ? "" : fmtPct(r.p_above_next, 0)}</td>` : ""}
       <td class="num">${fmtNum(r.games)}</td>
       <td class="num wdl"><span class="w">${r.wins ?? 0}</span>/<span class="d">${r.draws ?? 0}</span>/<span class="l">${r.losses ?? 0}</span></td>
       <td class="num">${fmtPct(r.score, 1)}</td>
-      ${compact ? "" : html`<td class="num" title="${illegal} illegal attempts over ${moves} moves">${moves ? fmtPct(illegal / moves, 1) : "–"}</td>
+      ${compact ? "" : html`${anyQuality ? html`<td class="num" title="${qualityTitle}">${judged ? fmtNum(st.acpl) : "–"}</td>
+      <td class="num" title="${qualityTitle}">${judged ? fmtNum(st.blunders_per_100, 1) : "–"}</td>` : ""}
+      <td class="num" title="${illegal} illegal attempts over ${moves} moves">${moves ? fmtPct(illegal / moves, 1) : "–"}</td>
       <td class="num" title="${forfeitTitle}">${forfeits || (moves ? "0" : "–")}</td>
       <td class="num">${fmtSecs(st.avg_move_s)}</td>
       ${anyTokens ? html`<td class="num" title="in ${fmtNum(st.input_tokens)} / out ${fmtNum(st.output_tokens)}">${fmtTokens(tokens)}</td>` : ""}
@@ -73,11 +86,14 @@ export function standingsTable(rows, stats = {}, { compact = false } = {}) {
       <th class="num" scope="col">#</th>
       <th scope="col">Player</th>
       <th class="num" scope="col">Elo</th>
-      <th scope="col" title="95% bootstrap confidence interval">95% CI</th>
+      <th scope="col" title="95% bootstrap confidence interval (hover for how many more games would narrow it to ±50)">95% CI</th>
+      ${anyNext ? html`<th class="num" scope="col" title="Probability (from the bootstrap) that this player is really stronger than the one ranked below">P(&gt;next)</th>` : ""}
       <th class="num" scope="col">Games</th>
       <th class="num" scope="col" title="Wins / draws / losses">W/D/L</th>
       <th class="num" scope="col">Score</th>
-      ${compact ? "" : html`<th class="num" scope="col" title="Illegal move attempts per move played">Illegal</th>
+      ${compact ? "" : html`${anyQuality ? html`<th class="num" scope="col" title="Average centipawn loss per judged move (engine analysis; lower is better)">ACPL</th>
+      <th class="num" scope="col" title="Blunders (≥ 300 centipawns lost) per 100 judged moves">Blund./100</th>` : ""}
+      <th class="num" scope="col" title="Illegal move attempts per move played">Illegal</th>
       <th class="num" scope="col" title="Games lost by forfeit (illegal moves, timeout, error)">Forfeits</th>
       <th class="num" scope="col">Avg move</th>
       ${anyTokens ? html`<th class="num" scope="col">Tokens</th>` : ""}

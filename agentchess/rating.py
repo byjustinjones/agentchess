@@ -50,9 +50,27 @@ class RatingRow:
     score: float             # points / games
     performance: Optional[float]
     rank: int
+    opponents: int = 0                     # distinct opponents faced
+    linked_to_anchor: bool = True          # False: no chain of games connects this player to an anchor,
+                                           # so the rating is only relative to its own group (prior-centred)
+    games_for_ci50: Optional[int] = None   # estimated extra games needed for a +-50 Elo 95% CI (None: already there / anchored)
+    p_above_next: Optional[float] = None   # bootstrap P(rating > next-ranked player's rating); None for the last row
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass
+class RatingReport:
+    """Ratings plus the pairwise comparison derived from the same bootstrap."""
+    rows: list[RatingRow]
+    superiority: dict[str, dict[str, float]]   # superiority[a][b] = P(rating_a > rating_b), a != b
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"ratings": [r.to_dict() for r in self.rows], "superiority": self.superiority}
+
+
+CI_TARGET_HALFWIDTH = 50.0
 
 
 def expected_score(ra: float, rb: float) -> float:
@@ -183,6 +201,32 @@ def _percentile(sorted_vals: list[float], q: float) -> float:
     return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
 
 
+def _components(n: int, edges: Iterable[tuple[int, int]]) -> list[int]:
+    """Connected-component label per node (union-find)."""
+    parent = list(range(n))
+
+    def find(x: int) -> int:
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for a, b in edges:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+    return [find(i) for i in range(n)]
+
+
+def _binom_two_sided_p(k: int, n: int) -> Optional[float]:
+    """Two-sided exact sign test: P(#successes as or more extreme than k | n, p=0.5)."""
+    if n <= 0:
+        return None
+    pk = [math.comb(n, i) / 2.0 ** n for i in range(n + 1)]
+    p = sum(v for v in pk if v <= pk[k] + 1e-12)
+    return min(1.0, p)
+
+
 # --------------------------------------------------------------------------- public API
 def compute_ratings(results: list[dict], players: list[PlayerSpec], *, use_anchors: bool = True,
                     base: float = 1500.0, prior_sd: float = 400.0, bootstrap: int = 300,
@@ -192,9 +236,18 @@ def compute_ratings(results: list[dict], players: list[PlayerSpec], *, use_ancho
     Returns one row per player with ≥1 decided game, sorted by elo desc (rank 1 = best).
     Bootstrap is deterministic for a given ``seed``; ``bootstrap=0`` gives zero-width CIs.
     """
+    return rating_report(results, players, use_anchors=use_anchors, base=base, prior_sd=prior_sd,
+                         bootstrap=bootstrap, seed=seed).rows
+
+
+def rating_report(results: list[dict], players: list[PlayerSpec], *, use_anchors: bool = True,
+                  base: float = 1500.0, prior_sd: float = 400.0, bootstrap: int = 300,
+                  seed: int = 0) -> RatingReport:
+    """Like :func:`compute_ratings` but also returns the pairwise superiority matrix
+    ``P(rating_a > rating_b)`` estimated from the bootstrap (0.5 for every pair when ``bootstrap=0``)."""
     games = _parse_results(results)
     if not games:
-        return []
+        return RatingReport([], {})
     specs = {p.id: p for p in players}
     ids: list[str] = []
     index: dict[str, int] = {}
@@ -259,9 +312,9 @@ def compute_ratings(results: list[dict], players: list[PlayerSpec], *, use_ancho
     elo = solve(aggregate(enc), init, 1e-6)
 
     ci_low, ci_high = list(elo), list(elo)
+    samples: list[list[float]] = [[] for _ in range(n_players)]
     if bootstrap > 0:
         rng = random.Random(seed)
-        samples: list[list[float]] = [[] for _ in range(n_players)]
         n_games = len(enc)
         for _ in range(bootstrap):
             rb = solve(aggregate(rng.choices(enc, k=n_games)), elo, 1e-3)
@@ -277,10 +330,17 @@ def compute_ratings(results: list[dict], players: list[PlayerSpec], *, use_ancho
 
     # Performance: opponents' mean final elo + clamped logistic score term.
     opp_sum = [0.0] * n_players
+    opponents: list[set[int]] = [set() for _ in range(n_players)]
     for w, b, _ in games:
         iw, ib = index[w], index[b]
         opp_sum[iw] += elo[ib]
         opp_sum[ib] += elo[iw]
+        opponents[iw].add(ib)
+        opponents[ib].add(iw)
+
+    # Which players are tied to an anchor through a chain of games?
+    comp = _components(n_players, pair_ends)
+    anchored_comps = {comp[i] for i in anchors}
 
     rows: list[RatingRow] = []
     for pid, i in index.items():
@@ -293,6 +353,11 @@ def compute_ratings(results: list[dict], players: list[PlayerSpec], *, use_ancho
         else:
             delta = max(-PERF_CLAMP, min(PERF_CLAMP, 400.0 * math.log10(score / (1.0 - score))))
         spec = specs.get(pid)
+        half = (ci_high[i] - ci_low[i]) / 2.0
+        needed: Optional[int] = None
+        if i not in anchors and bootstrap > 0 and half > CI_TARGET_HALFWIDTH:
+            # CI half-width shrinks roughly with 1/sqrt(games).
+            needed = max(1, int(math.ceil(g * ((half / CI_TARGET_HALFWIDTH) ** 2 - 1.0))))
         rows.append(RatingRow(
             player_id=pid,
             name=spec.name if spec else pid,
@@ -300,19 +365,53 @@ def compute_ratings(results: list[dict], players: list[PlayerSpec], *, use_ancho
             elo=elo[i], ci_low=ci_low[i], ci_high=ci_high[i], anchored=i in anchors,
             games=g, wins=wins[i], draws=draws[i], losses=losses[i], score=score,
             performance=opp_sum[i] / g + delta, rank=0,
+            opponents=len(opponents[i]),
+            linked_to_anchor=(not anchors) or comp[i] in anchored_comps,
+            games_for_ci50=needed,
         ))
     rows.sort(key=lambda r: (-r.elo, r.name, r.player_id))
     for k, row in enumerate(rows, 1):
         row.rank = k
-    return rows
+
+    # Pairwise superiority from the bootstrap replicates (anchors are constant across replicates).
+    def sample_of(i: int) -> list[float]:
+        return samples[i] if samples[i] else [elo[i]]
+
+    superiority: dict[str, dict[str, float]] = {}
+    for ra in rows:
+        ia = index[ra.player_id]
+        sa = sample_of(ia)
+        superiority[ra.player_id] = {}
+        for rb_ in rows:
+            if rb_ is ra:
+                continue
+            ib = index[rb_.player_id]
+            sb = sample_of(ib)
+            if len(sa) == 1 and len(sb) == 1:
+                p = 1.0 if sa[0] > sb[0] else 0.0 if sa[0] < sb[0] else 0.5
+            else:
+                n = max(len(sa), len(sb))
+                p = sum((1.0 if x > y else 0.5 if x == y else 0.0)
+                        for x, y in zip(_cycle(sa, n), _cycle(sb, n))) / n
+            superiority[ra.player_id][rb_.player_id] = p
+    for k, row in enumerate(rows):
+        if k + 1 < len(rows):
+            row.p_above_next = superiority[row.player_id][rows[k + 1].player_id]
+    return RatingReport(rows, superiority)
+
+
+def _cycle(xs: list[float], n: int) -> list[float]:
+    return xs if len(xs) == n else [xs[k % len(xs)] for k in range(n)]
 
 
 def crosstable(results: list[dict], player_ids: list[str]) -> dict:
     """Head-to-head table. ``cells[a][b]`` is from a's perspective for every a != b in
-    ``player_ids`` (``games == 0`` when they have not met); ``score`` is points (w + d/2)."""
+    ``player_ids`` (``games == 0`` when they have not met); ``score`` is points (w + d/2).
+    ``p`` is the two-sided exact sign-test p-value of wins vs losses (draws ignored; None
+    without decisive games): small values mean the head-to-head edge is unlikely to be luck."""
     wanted = set(player_ids)
-    cells: dict[str, dict[str, dict[str, float]]] = {
-        a: {b: {"w": 0, "d": 0, "l": 0, "score": 0.0, "games": 0} for b in player_ids if b != a}
+    cells: dict[str, dict[str, dict[str, Any]]] = {
+        a: {b: {"w": 0, "d": 0, "l": 0, "score": 0.0, "games": 0, "p": None} for b in player_ids if b != a}
         for a in player_ids
     }
     for w, b, s in _parse_results(results):
@@ -323,6 +422,10 @@ def crosstable(results: list[dict], player_ids: list[str]) -> dict:
             c["games"] += 1
             c["score"] += pts
             c["w" if pts == 1.0 else "l" if pts == 0.0 else "d"] += 1
+    for a in player_ids:
+        for b, c in cells[a].items():
+            decisive = c["w"] + c["l"]
+            c["p"] = _binom_two_sided_p(c["w"], decisive) if decisive else None
     return {"players": list(player_ids), "cells": cells}
 
 

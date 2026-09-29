@@ -14,7 +14,7 @@ from typing import Any, Awaitable, Optional
 import chess
 import chess.pgn
 
-from agentchess.db import Database
+from agentchess.db import MAX_COMMENT_CHARS, Database
 from agentchess.events import EventBus
 from agentchess.models import (
     GameRecord,
@@ -261,10 +261,26 @@ class _Runner:
 
     async def play_move(self) -> None:
         color = self.board.turn
-        player = self.players[color]
         pid = self.ids[color]
         attempts: list[MoveAttempt] = []
         usage_total: dict[str, Any] = {}
+        t_start = time.monotonic()
+        try:
+            await self._play_move(color, attempts, usage_total)
+        except _GameOver:
+            # The game ended during this move (forfeit, timeout, resignation, error, abort):
+            # keep what the player did on it so stats and the GUI don't lose it.
+            self.game.final_attempt = {
+                "player_id": pid, "color": _COLOR[color], "ply": len(self.board.move_stack),
+                "attempt": len(attempts) + 1, "illegal_attempts": [a.__dict__ for a in attempts],
+                "usage": dict(usage_total), "elapsed_s": round(time.monotonic() - t_start, 3),
+            }
+            raise
+
+    async def _play_move(self, color: chess.Color, attempts: list[MoveAttempt],
+                         usage_total: dict[str, Any]) -> None:
+        player = self.players[color]
+        pid = self.ids[color]
         previous_error: Optional[str] = None
         t_start = time.monotonic()
         while True:
@@ -298,6 +314,8 @@ class _Runner:
                     # crash persistence and turn the game into an unrated ABORTED one.
                     comment = resp.comment if resp.comment is None or isinstance(resp.comment, str) \
                         else str(resp.comment)
+                    if comment is not None and len(comment) > MAX_COMMENT_CHARS:
+                        comment = comment[:MAX_COMMENT_CHARS]   # same limit as storage; keeps WS events small
                     self._record(move, color, elapsed, time.monotonic() - t_start, attempts,
                                  comment, usage_total)
                     return
@@ -386,6 +404,7 @@ async def play_game(
     game.started_at = now()
     game.finished_at = None
     game.result = game.termination = game.termination_detail = game.pgn = None
+    game.final_attempt = None
     if db is not None:
         db.clear_moves(game.id)
         db.update_game(game)

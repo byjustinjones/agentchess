@@ -64,13 +64,18 @@ class Settings:
     seed: bool = True            # add default players (random + stockfish ladder) to an empty DB
     bootstrap: int = 200         # bootstrap resamples for rating confidence intervals
     cors_origins: list[str] = field(default_factory=list)
+    # Post-game engine analysis (ACPL, blunders...): depth 0 disables it; ``analysis_auto``
+    # analyses every game as it finishes (one low-priority single-threaded engine process).
+    analysis_depth: int = 12
+    analysis_auto: bool = True
 
 
 # ------------------------------------------------------------------- runtime
 class Runtime:
     """The live services (shared by the HTTP server and the headless CLI)."""
 
-    def __init__(self, db: Database) -> None:
+    def __init__(self, db: Database, analysis_depth: int = 12, analysis_auto: bool = True) -> None:
+        from agentchess.analysis import AnalysisService
         from agentchess.players.remote import AgentHub
         from agentchess.tournament import TournamentManager
 
@@ -79,10 +84,14 @@ class Runtime:
         self.hub = AgentHub(self.bus)
         self.ctx = PlayerContext(agent_hub=self.hub)
         self.manager = TournamentManager(db, self.bus, self.ctx)
+        self.analysis = AnalysisService(db, find_stockfish(), depth=analysis_depth, bus=self.bus)
+        self.analysis_auto = analysis_auto
         self._sweeper: Optional[asyncio.Task] = None
+        self._watcher: Optional[asyncio.Task] = None
 
     @classmethod
-    def open(cls, db_path: str, seed: bool = False) -> "Runtime":
+    def open(cls, db_path: str, seed: bool = False, analysis_depth: int = 12,
+             analysis_auto: bool = True) -> "Runtime":
         db = Database(db_path)
         if seed:
             try:
@@ -91,7 +100,7 @@ class Runtime:
                     log.info("seeded default players: %s", ", ".join(p.id for p in added))
             except Exception:  # never block startup on seeding
                 log.exception("seeding default players failed")
-        return cls(db)
+        return cls(db, analysis_depth=analysis_depth, analysis_auto=analysis_auto)
 
     async def start(self, resume: bool = True) -> None:
         if resume:
@@ -99,6 +108,9 @@ class Runtime:
         else:
             self.db.recover_interrupted_games()
         self._sweeper = asyncio.create_task(self._sweep_agents())
+        self.analysis.start()
+        if self.analysis_auto and self.analysis.available:
+            self._watcher = asyncio.create_task(self._watch_finished())
 
     async def _sweep_agents(self, interval_s: float = 15.0) -> None:
         """Periodically re-check agent presence so silent agents are reported offline."""
@@ -109,11 +121,24 @@ class Runtime:
             except Exception:  # pragma: no cover
                 log.exception("agent sweep failed")
 
+    async def _watch_finished(self) -> None:
+        """Queue every finished game for engine analysis."""
+        q = self.bus.subscribe()
+        try:
+            while True:
+                ev = await q.get()
+                if ev.get("type") == "game_finished" and (ev.get("game") or {}).get("status") == "finished":
+                    self.analysis.enqueue(ev["game"]["id"])
+        finally:
+            self.bus.unsubscribe(q)
+
     async def stop(self) -> None:
-        if self._sweeper:
-            self._sweeper.cancel()
+        for task in (self._sweeper, self._watcher):
+            if task:
+                task.cancel()
         try:
             await self.manager.shutdown()
+            await self.analysis.stop()
         finally:
             self.db.close()
 
@@ -126,32 +151,49 @@ def row_to_dict(row: Any) -> dict[str, Any]:
 
 
 class RatingService:
-    """compute_ratings with a cache keyed by (tournament, anchors, #rated games, player anchors)."""
+    """rating_report with a cache keyed by (tournament, anchors, #rated games, player anchors)."""
 
     def __init__(self, bootstrap: int) -> None:
         self.bootstrap = bootstrap
-        self._cache: dict[tuple, list[Any]] = {}
+        self._cache: dict[tuple, Any] = {}
 
-    async def ratings(self, db: Database, tournament_id: Optional[str] = None, anchors: bool = True,
-                      results: Optional[list[dict[str, Any]]] = None) -> list[Any]:
-        from agentchess.rating import compute_ratings
+    async def report(self, db: Database, tournament_id: Optional[str] = None, anchors: bool = True,
+                     results: Optional[list[dict[str, Any]]] = None) -> Any:
+        """``RatingReport`` (rows + pairwise superiority)."""
+        from agentchess.rating import rating_report
 
         results = db.rated_results(tournament_id) if results is None else results
         players = db.list_players(include_inactive=True)
         sig = tuple((p.id, p.name, p.anchor_elo) for p in players)
         key = (tournament_id, anchors, len(results), results[-1]["id"] if results else None, sig)
         if key not in self._cache:
-            rows = await asyncio.to_thread(
-                compute_ratings, results, players, use_anchors=anchors, bootstrap=self.bootstrap)
+            rep = await asyncio.to_thread(
+                rating_report, results, players, use_anchors=anchors, bootstrap=self.bootstrap)
             if len(self._cache) > 64:
                 self._cache.clear()
-            self._cache[key] = rows
+            self._cache[key] = rep
         return self._cache[key]
+
+    async def ratings(self, db: Database, tournament_id: Optional[str] = None, anchors: bool = True,
+                      results: Optional[list[dict[str, Any]]] = None) -> list[Any]:
+        return (await self.report(db, tournament_id, anchors, results)).rows
 
 
 # ------------------------------------------------------------------ helpers
 def _names(db: Database) -> dict[str, str]:
     return {p.id: p.name for p in db.list_players(include_inactive=True)}
+
+
+def player_stats(db: Database, tournament_id: Optional[str] = None) -> dict[str, dict[str, Any]]:
+    """Per-player move stats + forfeit counts + engine move-quality stats (when analysed)."""
+    stats: dict[str, dict[str, Any]] = {}
+    for pid, d in db.move_stats(tournament_id).items():
+        stats.setdefault(pid, {}).update({k: v for k, v in d.items() if k != "player_id"})
+    for pid, d in db.termination_stats(tournament_id).items():
+        stats.setdefault(pid, {}).update(d)
+    for pid, d in db.analysis_stats(tournament_id).items():
+        stats.setdefault(pid, {}).update(d)
+    return stats
 
 
 def game_dict(g: GameRecord, names: dict[str, str], include_moves: bool = False) -> dict[str, Any]:
@@ -247,12 +289,36 @@ def _validate_tournament_config(db: Database, cfg: TournamentConfig) -> None:
             raise HTTPException(400, "candidate_ids must be a subset of player_ids")
     if cfg.games_per_pair < 1:
         raise HTTPException(400, "games_per_pair must be >= 1")
+    if cfg.openings == "builtin" and cfg.games_per_pair % 2:
+        raise HTTPException(400, "games_per_pair must be even with builtin openings (each opening is "
+                                 "played once with each colour); use openings 'none' for an odd number")
     if cfg.concurrency < 1:
         raise HTTPException(400, "concurrency must be >= 1")
     _validate_game_config(cfg.game)
 
 
 # ------------------------------------------------------------ request models
+# Typed mirrors of the config dataclasses: a body with the wrong types (``"games_per_pair": "two"``)
+# is rejected with 422 by FastAPI instead of crashing later in the scheduler.
+class GameConfigIn(BaseModel):
+    move_timeout_s: float = 300.0
+    max_illegal_attempts: int = 3
+    max_plies: int = 300
+    show_legal_moves: bool = True
+
+
+class TournamentConfigIn(BaseModel):
+    player_ids: list[str]
+    format: str = "round_robin"
+    candidate_ids: list[str] = []
+    games_per_pair: int = 2
+    openings: str = "builtin"
+    concurrency: int = 4
+    wait_for_remote: bool = True
+    game: GameConfigIn = GameConfigIn()
+    seed: int = 0
+
+
 class PlayerCreate(BaseModel):
     name: Optional[str] = None
     kind: Optional[str] = None
@@ -273,14 +339,14 @@ class PlayerPatch(BaseModel):
 
 class TournamentCreate(BaseModel):
     name: str
-    config: dict[str, Any]
+    config: TournamentConfigIn
     start: bool = False
 
 
 class GameCreate(BaseModel):
     white_id: str
     black_id: str
-    config: Optional[dict[str, Any]] = None
+    config: Optional[GameConfigIn] = None
     opening_id: Optional[str] = None
 
 
@@ -339,9 +405,7 @@ def build_api_router() -> APIRouter:
             "finished": s.db.count_games(player_id=player_id, status=GameStatus.FINISHED.value),
             "running": s.db.count_games(player_id=player_id, status=GameStatus.RUNNING.value),
         }
-        stats.update(s.db.move_stats().get(player_id, {}))
-        stats.update(s.db.termination_stats().get(player_id, {}))
-        stats.pop("player_id", None)
+        stats.update(player_stats(s.db).get(player_id, {}))
         rows = await s.ratings.ratings(s.db, None, True)
         rating = next((row_to_dict(r) for r in rows if r.player_id == player_id), None)
         return {**_player_out(p, s.hub), "stats": stats, "rating": rating}
@@ -403,7 +467,7 @@ def build_api_router() -> APIRouter:
         if not body.name.strip():
             raise HTTPException(400, "name is required")
         try:
-            cfg = TournamentConfig.from_dict(body.config)
+            cfg = TournamentConfig.from_dict(body.config.model_dump())
         except (TypeError, ValueError) as e:
             raise HTTPException(400, f"invalid tournament config: {e}") from None
         _validate_tournament_config(s.db, cfg)
@@ -423,14 +487,25 @@ def build_api_router() -> APIRouter:
         s = st(request)
         t = _tournament_or_404(s.db, tournament_id)
         results = s.db.rated_results(tournament_id)
-        rows = await s.ratings.ratings(s.db, tournament_id, True, results=results)
+        rep = await s.ratings.report(s.db, tournament_id, True, results=results)
         players = [p.to_dict() for pid in t.config.player_ids if (p := s.db.get_player(pid))]
         return {
             **t_out(s, t),
-            "standings": [row_to_dict(r) for r in rows],
+            "standings": [row_to_dict(r) for r in rep.rows],
+            "superiority": rep.superiority,
             "crosstable": crosstable(results, t.config.player_ids),
             "players": players,
         }
+
+    @api.post("/tournaments/{tournament_id}/analyse")
+    async def analyse_tournament(tournament_id: str, request: Request) -> dict[str, Any]:
+        """Queue engine analysis for every finished game of the tournament that lacks one."""
+        s = st(request)
+        _tournament_or_404(s.db, tournament_id)
+        if not s.runtime.analysis.available:
+            raise HTTPException(503, "engine analysis is not available (no Stockfish or analysis disabled)")
+        return {"queued": s.runtime.analysis.enqueue_missing(tournament_id),
+                "pending": s.runtime.analysis.pending()}
 
     async def _action(request: Request, tournament_id: str, action: str) -> dict[str, Any]:
         s = st(request)
@@ -510,7 +585,7 @@ def build_api_router() -> APIRouter:
 
             if not any(o.id == body.opening_id for o in BUILTIN_OPENINGS):
                 raise HTTPException(400, f"unknown opening {body.opening_id}")
-        cfg = GameConfig.from_dict(body.config)
+        cfg = GameConfig.from_dict(body.config.model_dump() if body.config else None)
         _validate_game_config(cfg)
         try:
             g = await s.manager.play_single(body.white_id, body.black_id, cfg, opening_id=body.opening_id)
@@ -525,6 +600,44 @@ def build_api_router() -> APIRouter:
         if g is None:
             raise HTTPException(404, f"game {game_id} not found")
         return game_dict(g, _names(s.db), include_moves=True)
+
+    @api.get("/games/{game_id}/analysis")
+    async def get_game_analysis(game_id: str, request: Request) -> dict[str, Any]:
+        """Stored engine analysis of a finished game (404 until it has been analysed)."""
+        s = st(request)
+        if s.db.get_game(game_id, include_moves=False) is None:
+            raise HTTPException(404, f"game {game_id} not found")
+        a = s.db.get_analysis(game_id)
+        if a is None:
+            raise HTTPException(404, "game not analysed yet")
+        return a
+
+    @api.post("/games/{game_id}/analysis")
+    async def analyse_game(game_id: str, request: Request) -> dict[str, Any]:
+        """Analyse a finished game now (replacing any stored analysis) and return it."""
+        s = st(request)
+        g = s.db.get_game(game_id, include_moves=False)
+        if g is None:
+            raise HTTPException(404, f"game {game_id} not found")
+        if g.status != GameStatus.FINISHED:
+            raise HTTPException(409, "only finished games can be analysed")
+        svc = s.runtime.analysis
+        if not svc.available:
+            raise HTTPException(503, "engine analysis is not available (no Stockfish or analysis disabled)")
+        try:
+            a = await svc.analyse_now(game_id)
+        except Exception as e:  # engine crashed / could not start
+            log.exception("analysis of %s failed", game_id)
+            raise HTTPException(500, f"analysis failed: {e}") from None
+        if a is None:
+            raise HTTPException(409, "game is not finished")
+        return a
+
+    @api.get("/analysis/status")
+    async def analysis_status(request: Request) -> dict[str, Any]:
+        svc = st(request).runtime.analysis
+        return {"available": svc.available, "depth": svc.depth, "engine": svc.engine_path,
+                "pending": svc.pending(), "auto": st(request).runtime.analysis_auto}
 
     @api.get("/games/{game_id}/pgn", response_class=PlainTextResponse)
     async def get_game_pgn(game_id: str, request: Request) -> PlainTextResponse:
@@ -550,13 +663,9 @@ def build_api_router() -> APIRouter:
         if tournament_id:
             _tournament_or_404(s.db, tournament_id)
         results = s.db.rated_results(tournament_id)
-        rows = await s.ratings.ratings(s.db, tournament_id, anchors, results=results)
-        stats: dict[str, dict[str, Any]] = {}
-        for pid, d in s.db.move_stats(tournament_id).items():
-            stats.setdefault(pid, {}).update({k: v for k, v in d.items() if k != "player_id"})
-        for pid, d in s.db.termination_stats(tournament_id).items():
-            stats.setdefault(pid, {}).update(d)
-        return {"ratings": [row_to_dict(r) for r in rows], "stats": stats, "games": len(results)}
+        rep = await s.ratings.report(s.db, tournament_id, anchors, results=results)
+        return {"ratings": [row_to_dict(r) for r in rep.rows], "superiority": rep.superiority,
+                "stats": player_stats(s.db, tournament_id), "games": len(results)}
 
     @api.get("/live")
     async def live(request: Request) -> dict[str, Any]:
@@ -640,7 +749,8 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        rt = Runtime.open(settings.db_path, seed=settings.seed)
+        rt = Runtime.open(settings.db_path, seed=settings.seed, analysis_depth=settings.analysis_depth,
+                          analysis_auto=settings.analysis_auto)
         app.state.runtime = rt
         app.state.db = rt.db
         app.state.bus = rt.bus

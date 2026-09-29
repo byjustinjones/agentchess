@@ -20,16 +20,39 @@ def _err(msg: str) -> None:
 
 
 # ----------------------------------------------------------------- formatting
-def format_ratings(rows: list[Any]) -> str:
+def format_ratings(rows: list[Any], stats: Optional[dict[str, dict[str, Any]]] = None) -> str:
+    """Rating table. With ``stats`` (see ``server.app.player_stats``) move-quality columns are
+    added when any player has engine analysis: ACPL, blunders per 100 moves, missed wins."""
     if not rows:
         return "(no rated games)"
-    header = f"{'#':>3}  {'player':<28} {'elo':>6}  {'95% CI':>13}  {'games':>5}  {'W-D-L':>11}  {'score':>6}"
+    stats = stats or {}
+    quality = any((stats.get(r.player_id) or {}).get("judged_moves") for r in rows)
+    header = (f"{'#':>3}  {'player':<28} {'elo':>6}  {'95% CI':>13}  {'games':>5}  {'W-D-L':>11}  {'score':>6}"
+              f"  {'P(>next)':>8}  {'+games':>6}")
+    if quality:
+        header += f"  {'ACPL':>5}  {'bl/100':>6}  {'missed':>6}"
     lines = [header, "-" * len(header)]
     for r in rows:
         ci = "anchor" if r.anchored else f"{r.ci_low:.0f}..{r.ci_high:.0f}"
         wdl = f"{r.wins}-{r.draws}-{r.losses}"
-        lines.append(f"{r.rank:>3}  {r.name[:28]:<28} {r.elo:>6.0f}  {ci:>13}  {r.games:>5}  {wdl:>11}  "
-                     f"{100 * r.score:>5.1f}%")
+        p_next = "" if r.p_above_next is None else f"{100 * r.p_above_next:.0f}%"
+        need = "" if r.games_for_ci50 is None else str(r.games_for_ci50)
+        flag = "" if r.linked_to_anchor else " (unanchored)"
+        line = (f"{r.rank:>3}  {(r.name[:28] + flag)[:28]:<28} {r.elo:>6.0f}  {ci:>13}  {r.games:>5}  {wdl:>11}  "
+                f"{100 * r.score:>5.1f}%  {p_next:>8}  {need:>6}")
+        if quality:
+            q = stats.get(r.player_id) or {}
+            if q.get("judged_moves"):
+                line += f"  {q['acpl']:>5.0f}  {q['blunders_per_100']:>6.1f}  {q.get('missed_wins', 0):>6}"
+            else:
+                line += f"  {'':>5}  {'':>6}  {'':>6}"
+        lines.append(line)
+    lines.append("")
+    lines.append("P(>next): bootstrap probability that the player is really stronger than the next row; "
+                 "+games: extra games for a +-50 Elo CI.")
+    if quality:
+        lines.append("ACPL: average centipawn loss per judged move; bl/100: blunders (>=300 cp) per 100 moves; "
+                     "missed: games with a >=+5 eval that were not won.")
     return "\n".join(lines)
 
 
@@ -117,7 +140,8 @@ async def _run_async(args: argparse.Namespace) -> int:
     if args.serve:
         import uvicorn
 
-        app = create_app(Settings(db_path=args.db, host=args.host, port=args.port, resume=False, seed=False))
+        app = create_app(Settings(db_path=args.db, host=args.host, port=args.port, resume=False, seed=False,
+                                  analysis_depth=0 if args.no_analysis else args.analysis_depth))
         server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port, log_level="warning"))
         server_task = asyncio.create_task(server.serve())
         while not server.started:
@@ -128,7 +152,7 @@ async def _run_async(args: argparse.Namespace) -> int:
         rt: Runtime = app.state.runtime
         print(f"server listening on http://{args.host}:{args.port}")
     else:
-        rt = Runtime.open(args.db)
+        rt = Runtime.open(args.db, analysis_depth=0 if args.no_analysis else args.analysis_depth)
         await rt.start(resume=False)
 
     db, manager = rt.db, rt.manager
@@ -172,9 +196,15 @@ async def _run_async(args: argparse.Namespace) -> int:
 
         from agentchess.rating import compute_ratings, crosstable
 
+        if rt.analysis.available and rt.analysis.pending():
+            print(f"analysing {rt.analysis.pending()} games with the engine ...", flush=True)
+            while rt.analysis.pending():
+                await asyncio.sleep(0.5)
         results = db.rated_results(t.id)
         rows = compute_ratings(results, db.list_players(include_inactive=True), bootstrap=args.bootstrap)
-        print("\nStandings\n" + format_ratings(rows))
+        from agentchess.server.app import player_stats
+
+        print("\nStandings\n" + format_ratings(rows, player_stats(db, t.id)))
         print("\nCrosstable (score/games, row vs column)\n" + format_crosstable(crosstable(results, cfg.player_ids), names))
         if args.serve and args.linger:
             print("\ntournament finished; server still running (Ctrl-C to stop)")
@@ -204,7 +234,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
     from agentchess.server.app import Settings, create_app
 
     settings = Settings(db_path=args.db, host=args.host, port=args.port, resume=not args.no_resume,
-                        seed=not args.no_seed, cors_origins=args.cors or [])
+                        seed=not args.no_seed, cors_origins=args.cors or [],
+                        analysis_depth=0 if args.no_analysis else args.analysis_depth)
     uvicorn.run(create_app(settings), host=args.host, port=args.port, log_level=args.log_level)
     return 0
 
@@ -218,10 +249,12 @@ def cmd_ratings(args: argparse.Namespace) -> int:
         if args.tournament and db.get_tournament(args.tournament) is None:
             _err(f"unknown tournament {args.tournament}")
             return 1
+        from agentchess.server.app import player_stats
+
         results = db.rated_results(args.tournament)
         rows = compute_ratings(results, db.list_players(include_inactive=True),
                                use_anchors=not args.no_anchors, bootstrap=args.bootstrap)
-        print(format_ratings(rows))
+        print(format_ratings(rows, player_stats(db, args.tournament)))
         print(f"\n{len(results)} rated games")
     finally:
         db.close()
@@ -265,6 +298,84 @@ def cmd_add_player(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_analyse(args: argparse.Namespace) -> int:
+    """Engine-analyse finished games that have no stored analysis (or --force all) and print the table."""
+    from agentchess.analysis import EngineAnalyser, store
+    from agentchess.db import Database
+    from agentchess.server.app import player_stats
+    from agentchess.server.registry import find_stockfish
+
+    path = args.engine or find_stockfish()
+    if not path:
+        _err("no engine found (install stockfish, set $STOCKFISH_PATH or pass --engine)")
+        return 2
+    db = Database(args.db)
+    try:
+        if args.tournament and db.get_tournament(args.tournament) is None:
+            _err(f"unknown tournament {args.tournament}")
+            return 1
+        if args.game:
+            ids = [args.game]
+        elif args.force:
+            ids = [g.id for g in db.list_games(tournament_id=args.tournament, status="finished",
+                                               player_id=args.player, limit=10**9)]
+        else:
+            ids = db.unanalysed_game_ids(args.tournament, args.player)
+        if args.limit:
+            ids = ids[:args.limit]
+
+        async def run() -> None:
+            analyser = EngineAnalyser(path, depth=args.depth)
+            try:
+                for i, gid in enumerate(ids, 1):
+                    g = db.get_game(gid)
+                    if g is None or g.status.value != "finished":
+                        _err(f"skipping {gid}: not a finished game")
+                        continue
+                    res = await analyser.analyse(g)
+                    store(db, res)
+                    summary = ", ".join(f"{pid} acpl {s.acpl:.0f}" if s.acpl is not None else f"{pid} -"
+                                        for pid, s in res.players.items())
+                    print(f"[{i}/{len(ids)}] {gid} {g.white_id} {g.result} {g.black_id}: {summary}", flush=True)
+            finally:
+                await analyser.close()
+
+        asyncio.run(run())
+        names = {p.id: p.name for p in db.list_players(include_inactive=True)}
+        stats = player_stats(db, args.tournament)
+        rows = [(pid, d) for pid, d in stats.items() if d.get("judged_moves")]
+        rows.sort(key=lambda x: x[1]["acpl"])
+        if rows:
+            print(f"\n{'player':<28} {'games':>5} {'moves':>6} {'ACPL':>5} {'bl/100':>6} {'mi/100':>6} "
+                  f"{'best%':>5} {'missed':>6}")
+            for pid, d in rows:
+                print(f"{names.get(pid, pid)[:28]:<28} {d['analysed_games']:>5} {d['judged_moves']:>6} "
+                      f"{d['acpl']:>5.0f} {d['blunders_per_100']:>6.1f} {d['mistakes_per_100']:>6.1f} "
+                      f"{100 * d['best_move_rate']:>5.0f} {d['missed_wins']:>6}")
+    finally:
+        db.close()
+    return 0
+
+
+def cmd_relay(args: argparse.Namespace) -> int:
+    import os
+
+    from agentchess.relay import RelayConfig, run_relay
+
+    token = args.token or os.environ.get("AGENTCHESS_TOKEN")
+    if not token:
+        _err("a token is required (--token or $AGENTCHESS_TOKEN)")
+        return 2
+    cfg = RelayConfig(server=args.server, token=token, claude_cmd=args.claude_cmd, model=args.model,
+                      effort=args.effort, moves_per_session=args.moves_per_session,
+                      max_think_s=args.max_think_s, log_dir=args.log_dir, max_games=args.max_games,
+                      idle_exit_s=args.idle_exit_s, extra_args=args.claude_arg or [], bare=args.bare)
+    try:
+        return asyncio.run(run_relay(cfg))
+    except KeyboardInterrupt:
+        return 130
+
+
 def cmd_mcp(args: argparse.Namespace) -> int:
     import os
 
@@ -292,6 +403,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-seed", action="store_true", help="don't add default players to an empty DB")
     s.add_argument("--cors", action="append", metavar="ORIGIN", help="allowed CORS origin (repeatable)")
     s.add_argument("--log-level", default="info")
+    _analysis_args(s)
     s.set_defaults(func=cmd_serve)
 
     r = sub.add_parser("run", help="run a tournament from a YAML file (headless)")
@@ -302,6 +414,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--port", type=int, default=8000)
     r.add_argument("--linger", action="store_true", help="with --serve: keep serving after the tournament ends")
     r.add_argument("--bootstrap", type=int, default=200)
+    _analysis_args(r)
     r.set_defaults(func=cmd_run)
 
     ra = sub.add_parser("ratings", help="print the rating table")
@@ -326,11 +439,49 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--max-concurrent", type=int)
     a.set_defaults(func=cmd_add_player)
 
+    an = sub.add_parser("analyse", aliases=["analyze"],
+                        help="engine-analyse finished games (ACPL, blunders, missed wins) and print the table")
+    an.add_argument("--db", default=DEFAULT_DB)
+    an.add_argument("--tournament")
+    an.add_argument("--player", help="only games of this player id")
+    an.add_argument("--game", help="a single game id (re-analysed even if stored)")
+    an.add_argument("--depth", type=int, default=12)
+    an.add_argument("--engine", help="UCI engine path (default: Stockfish auto-detect)")
+    an.add_argument("--force", action="store_true", help="re-analyse games that already have an analysis")
+    an.add_argument("--limit", type=int, default=0, help="analyse at most N games (0 = all)")
+    an.set_defaults(func=cmd_analyse)
+
+    rl = sub.add_parser("relay", help="play a remote player with Claude Code (claude -p) in a relay of sessions")
+    rl.add_argument("--server", default="http://127.0.0.1:8000")
+    rl.add_argument("--token", help="remote player token (or $AGENTCHESS_TOKEN)")
+    rl.add_argument("--claude-cmd", default="claude", help="Claude Code executable (default: claude)")
+    rl.add_argument("--model", help="model alias or id passed to claude --model")
+    rl.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    rl.add_argument("--moves-per-session", type=int, default=40,
+                    help="hand a game over to a fresh session after this many accepted moves (0 = never)")
+    rl.add_argument("--max-think-s", type=float, default=0, help="cap per-move thinking time (0 = the game's limit)")
+    rl.add_argument("--max-games", type=int, default=0, help="stop after this many finished games (0 = run forever)")
+    rl.add_argument("--idle-exit-s", type=float, default=0,
+                    help="exit after this long without a move request (0 = wait forever)")
+    rl.add_argument("--log-dir", help="write one JSONL transcript per game here")
+    rl.add_argument("--bare", action="store_true",
+                    help="run claude with --bare (skips hooks/plugins/memory; authenticates with "
+                         "ANTHROPIC_API_KEY only, not a Claude subscription login)")
+    rl.add_argument("--claude-arg", action="append", metavar="ARG",
+                    help="extra argument for claude (repeatable)")
+    rl.set_defaults(func=cmd_relay)
+
     m = sub.add_parser("mcp", help="run the stdio MCP bridge for an MCP-capable agent")
     m.add_argument("--server", default="http://127.0.0.1:8000")
     m.add_argument("--token", help="remote player token (or $AGENTCHESS_TOKEN)")
     m.set_defaults(func=cmd_mcp)
     return p
+
+
+def _analysis_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--analysis-depth", type=int, default=12,
+                   help="engine depth for automatic post-game analysis (default 12)")
+    p.add_argument("--no-analysis", action="store_true", help="don't analyse finished games with the engine")
 
 
 def load_dotenv(path: Path = Path(".env")) -> list[str]:

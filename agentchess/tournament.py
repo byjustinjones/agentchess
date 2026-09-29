@@ -83,6 +83,9 @@ def _validate(cfg: TournamentConfig, players: dict[str, PlayerSpec]) -> list[str
         raise ValueError("games_per_pair must be >= 1")
     if cfg.openings not in ("builtin", "none"):
         raise ValueError(f"unknown openings option: {cfg.openings!r}")
+    if cfg.openings == "builtin" and cfg.games_per_pair % 2:
+        raise ValueError("games_per_pair must be even with builtin openings, so every opening is "
+                         "played once with each colour (use openings: none for an odd number)")
     return ids
 
 
@@ -305,7 +308,7 @@ class TournamentManager:
             if tid:
                 self.db.clear_moves(gid)
                 g.status, g.started_at, g.pgn = GameStatus.SCHEDULED, None, None
-                g.result = g.termination = g.termination_detail = None
+                g.result = g.termination = g.termination_detail = g.final_attempt = None
                 self.db.update_game(g)
             else:
                 self._set_aborted(g, "server shutdown")
@@ -414,7 +417,9 @@ class TournamentManager:
                 return False
             if wait_for_remote and spec is not None and spec.kind == PlayerKind.REMOTE:
                 hub = self.ctx.agent_hub
-                if hub is not None and not hub.is_online(pid):
+                # is_ready (agent actually waiting / seen seconds ago) beats is_online (60 s grace).
+                ready = getattr(hub, "is_ready", None) or getattr(hub, "is_online", None)
+                if hub is not None and ready is not None and not ready(pid):
                     return False
         return True
 

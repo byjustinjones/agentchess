@@ -13,6 +13,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
+import re
 from typing import Any, Optional
 
 import chess
@@ -41,10 +43,45 @@ class MoveBody(BaseModel):
     move: str
     request_id: Optional[str] = None
     comment: Optional[str] = None
+    # Optional self-reported resource usage for this move, e.g.
+    # {"input_tokens": 1200, "output_tokens": 800, "cost_usd": 0.02, "model": "..."}; it is
+    # stored with the move and summed into the leaderboard's token/cost columns.
+    usage: Optional[dict[str, Any]] = None
 
 
 class ResignBody(BaseModel):
     request_id: Optional[str] = None
+
+
+MAX_USAGE_KEYS = 16
+USAGE_KEY_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
+MAX_AGENT_COMMENT_CHARS = 8000
+
+
+def clean_usage(usage: Any) -> dict[str, Any]:
+    """Keep a remote agent's usage report small and well-typed: snake_case keys, finite
+    non-negative numbers or short strings; anything else is dropped."""
+    if not isinstance(usage, dict):
+        return {}
+    out: dict[str, Any] = {}
+    for k, v in usage.items():
+        if len(out) >= MAX_USAGE_KEYS or not isinstance(k, str) or not USAGE_KEY_RE.match(k):
+            continue
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            if math.isfinite(v) and v >= 0:
+                out[k] = v
+        elif isinstance(v, str) and len(v) <= 64:
+            out[k] = v
+    return out
+
+
+def clean_comment(comment: Any) -> Optional[str]:
+    if comment is None:
+        return None
+    s = comment if isinstance(comment, str) else str(comment)
+    return s[:MAX_AGENT_COMMENT_CHARS]
 
 
 # ----------------------------------------------------------------------- auth
@@ -63,10 +100,13 @@ def resolve_token(db: Database, token: Optional[str]) -> PlayerSpec:
 
 
 def _bearer(request: Request) -> Optional[str]:
+    """HTTP routes take the token from the Authorization header only: a ``?token=`` query
+    parameter would end up in access logs and proxies (the WebSocket route still accepts
+    it because browsers cannot set headers on WebSocket connections)."""
     auth = request.headers.get("authorization", "")
     if auth.lower().startswith("bearer "):
         return auth[7:].strip()
-    return request.query_params.get("token")
+    return None
 
 
 async def current_agent(request: Request) -> PlayerSpec:
@@ -144,7 +184,8 @@ def check_move(req: MoveRequest, move: str, max_attempts: int) -> dict[str, Any]
 
 
 def submit_move(state: Any, player: PlayerSpec, game_id: str, move: str,
-                request_id: Optional[str] = None, comment: Optional[str] = None) -> dict[str, Any]:
+                request_id: Optional[str] = None, comment: Optional[str] = None,
+                usage: Any = None) -> dict[str, Any]:
     """Shared by HTTP and WebSocket: validate + hand the move to the hub."""
     db: Database = state.db
     hub = state.hub
@@ -156,7 +197,8 @@ def submit_move(state: Any, player: PlayerSpec, game_id: str, move: str,
         raise AgentAPIError(409, f"stale request_id {request_id}; current is {req.request_id}")
     move = (move or "").strip()
     result = check_move(req, move, g.config.max_illegal_attempts)
-    accepted = hub.submit(player.id, req.request_id, MoveResponse(move=move, comment=comment))
+    accepted = hub.submit(player.id, req.request_id,
+                          MoveResponse(move=move, comment=clean_comment(comment), usage=clean_usage(usage)))
     if not accepted and result["error"] is None:
         result["error"] = "move request expired"
     return {"accepted": bool(accepted), "game_id": game_id, "request_id": req.request_id,
@@ -229,7 +271,8 @@ async def my_game(game_id: str, request: Request, player: PlayerSpec = Depends(c
 @router.post("/games/{game_id}/move")
 async def post_move(game_id: str, body: MoveBody, request: Request,
                     player: PlayerSpec = Depends(current_agent)) -> dict[str, Any]:
-    return _http(lambda: submit_move(request.app.state, player, game_id, body.move, body.request_id, body.comment))
+    return _http(lambda: submit_move(request.app.state, player, game_id, body.move, body.request_id, body.comment,
+                                     body.usage))
 
 
 @router.post("/games/{game_id}/resign")
@@ -295,7 +338,7 @@ async def agent_ws(ws: WebSocket, token: Optional[str] = Query(None)) -> None:
                     await send({"type": "pong"})
                 elif mtype == "move":
                     res = submit_move(state, player, str(msg.get("game_id", "")), str(msg.get("move", "")),
-                                      msg.get("request_id"), msg.get("comment"))
+                                      msg.get("request_id"), msg.get("comment"), msg.get("usage"))
                     await send({"type": "move_result", **res})
                 elif mtype == "resign":
                     res = submit_resign(state, player, str(msg.get("game_id", "")), msg.get("request_id"))

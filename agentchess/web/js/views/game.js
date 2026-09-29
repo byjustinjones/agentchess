@@ -1,8 +1,8 @@
 // Game view: large board, move list navigation, per-move details, live updates.
-import { get, apiUrl } from "../api.js";
+import { get, post, apiUrl } from "../api.js";
 import { Subscriptions } from "../ws.js";
 import {
-  html, render, enc, errorBanner, debounce, fmtResult, fmtTermination, fmtSecs, fmtNum, fmtCost,
+  html, raw, render, enc, errorBanner, debounce, fmtResult, fmtTermination, fmtSecs, fmtNum, fmtCost,
   fmtDate, statusBadge, copyText, toast,
 } from "../util.js";
 import { Board, uciSquares, parseFen } from "../board.js";
@@ -22,6 +22,9 @@ export default {
     let pendingIllegal = []; // illegal attempts for the move currently being thought about (live)
     let thinking = null; // {player_id, since}
     let board = null;
+    let analysis = null; // stored engine analysis {depth, engine, moves: [...], players: {...}} or null
+    let evalByPly = new Map();
+    let analysisAvailable = null; // server has an engine for analysis (null = unknown)
 
     render(root, html`<div id="game-error"></div><div id="game-body">${loading("Loading game")}</div>`);
 
@@ -41,6 +44,7 @@ export default {
             <p class="subtitle" id="game-sub"></p>
           </div>
           <div class="filters">
+            <button type="button" class="btn" data-act="analyse" id="analyse-btn" hidden title="Run Stockfish over every move of this game">Analyse</button>
             <a class="btn" href="${apiUrl(`games/${enc(g.id)}/pgn`)}" download="${`${g.id}.pgn`}">Download PGN</a>
           </div>
         </div>
@@ -68,6 +72,10 @@ export default {
             <section class="card card-tight" aria-labelledby="detail-title">
               <div class="card-head"><h2 id="detail-title">Details</h2></div>
               <div id="move-detail"></div>
+            </section>
+            <section class="card card-tight" aria-labelledby="an-title" id="an-card" hidden>
+              <div class="card-head"><h2 id="an-title">Engine analysis</h2><span class="muted small" id="an-meta"></span></div>
+              <div id="an-body"></div>
             </section>
           </div>
         </div>`);
@@ -131,7 +139,10 @@ export default {
       const cell = (k) => {
         const m = moves[k];
         const ill = Array.isArray(m.illegal_attempts) ? m.illegal_attempts.length : Number(m.illegal_attempts) || 0;
-        return html`<button type="button" class="mv${k + 1 === idx ? " active" : ""}${isBook(m) ? " book" : ""}" data-ply="${k + 1}" aria-current="${k + 1 === idx ? "true" : "false"}">${m.san || m.uci}${ill ? html`<span class="ill-badge" title="${ill} illegal attempt${ill > 1 ? "s" : ""}">!${ill > 1 ? ill : ""}</span>` : ""}</button>`;
+        const ev = evalByPly.get(m.ply);
+        const cls = ev && ev.judged ? lossClass(ev.loss) : "";
+        const mark = cls === "blunder" ? "??" : cls === "mistake" ? "?" : cls === "inaccuracy" ? "?!" : "";
+        return html`<button type="button" class="mv${k + 1 === idx ? " active" : ""}${isBook(m) ? " book" : ""}" data-ply="${k + 1}" aria-current="${k + 1 === idx ? "true" : "false"}">${m.san || m.uci}${mark ? html`<span class="eval-badge ${cls}" title="${cls}: ${ev.loss} centipawns lost">${mark}</span>` : ""}${ill ? html`<span class="ill-badge" title="${ill} illegal attempt${ill > 1 ? "s" : ""}">!${ill > 1 ? ill : ""}</span>` : ""}</button>`;
       };
       if (start.turn === "b" && moves.length) {
         rows.push(html`<span class="mv-num">${num}.</span><span class="mv-empty">…</span>${cell(0)}`);
@@ -184,6 +195,11 @@ export default {
       const g = game;
       if (idx === 0) {
         const c = g.config || {};
+        if (!moves.length) {
+          render(el, html`<dl class="kv"><div><dt>Status</dt><dd>${statusBadge(g.status)}</dd></div></dl>${finalAttemptBlock()}`);
+          if (g.status === "running") render(el, html`${el.innerHTML ? raw(el.innerHTML) : ""}${livePending()}`);
+          return;
+        }
         render(el, html`<dl class="kv">
           <div><dt>Status</dt><dd>${statusBadge(g.status)}</dd></div>
           <div><dt>Opening</dt><dd>${g.opening ? `${g.opening.name}${g.opening.eco ? ` (${g.opening.eco})` : ""}` : "Start position"}</dd></div>
@@ -215,9 +231,97 @@ export default {
           <div><dt>Illegal attempts</dt><dd class="${illCount ? "text-bad" : ""}">${illCount}</dd></div>
           ${usageBlock(m.usage)}
         </dl>
+        ${evalBlock(m)}
         ${illegalList(ill)}
         ${comment ? html`<h3 class="detail-h">Reasoning / comment</h3><pre class="comment">${comment}</pre>` : isBook(m) ? html`<p class="muted small">Book move from the opening suite (not played by the model).</p>` : html`<p class="muted small">No comment for this move.</p>`}
-        ${idx === moves.length ? livePending() : ""}`);
+        ${idx === moves.length ? livePending() : ""}
+        ${idx === moves.length ? finalAttemptBlock() : ""}`);
+    }
+
+    function evalBlock(m) {
+      const ev = evalByPly.get(m.ply);
+      if (!ev) return "";
+      const cls = ev.judged ? lossClass(ev.loss) : "";
+      const fmtEval = (cp) => (Math.abs(cp) >= 1000 ? (cp > 0 ? "winning (mate)" : "lost (mate)") : `${cp > 0 ? "+" : ""}${(cp / 100).toFixed(2)}`);
+      return html`<dl class="kv">
+        <div><dt>Engine eval</dt><dd>${fmtEval(ev.eval_before)} → ${fmtEval(ev.eval_after)} <span class="muted small">(mover's view)</span></dd></div>
+        <div><dt>Centipawn loss</dt><dd class="${cls ? `text-bad` : ""}">${ev.judged ? `${ev.loss}${cls ? ` (${cls})` : ""}` : html`<span class="muted">not judged — position already decided</span>`}</dd></div>
+        ${ev.best_uci ? html`<div><dt>Engine's choice</dt><dd><code>${ev.best_uci}</code>${ev.best_uci === m.uci ? html` <span class="muted small">(same)</span>` : ""}</dd></div>` : ""}
+      </dl>`;
+    }
+
+    function finalAttemptBlock() {
+      const fa = game && game.final_attempt;
+      if (!fa || game.status === "running") return "";
+      const who = fa.color === "white" ? game.white_name || game.white_id : game.black_name || game.black_id;
+      const u = fa.usage || {};
+      return html`<div class="final-attempt">
+        <h3 class="detail-h">Game ended on ${who}'s move ${Math.floor(fa.ply / 2) + 1}</h3>
+        <p class="muted small">${fmtTermination(game.termination)}${game.termination_detail ? ` — ${game.termination_detail}` : ""}${fa.elapsed_s != null ? ` · ${fmtSecs(fa.elapsed_s)} spent on this move` : ""}</p>
+        ${illegalList(fa.illegal_attempts || [])}
+        ${Object.keys(u).length ? html`<dl class="kv">${usageBlock(u)}</dl>` : ""}
+      </div>`;
+    }
+
+    function lossClass(loss) {
+      loss = Number(loss) || 0;
+      return loss >= 300 ? "blunder" : loss >= 100 ? "mistake" : loss >= 50 ? "inaccuracy" : "";
+    }
+
+    function paintAnalysis() {
+      const card = root.querySelector("#an-card");
+      const btn = root.querySelector("#analyse-btn");
+      if (!card || !game) return;
+      const finished = game.status === "finished";
+      btn.hidden = !finished || analysisAvailable === false;
+      btn.textContent = analysis ? "Re-analyse" : "Analyse";
+      if (!analysis) {
+        card.hidden = !finished;
+        if (finished) {
+          root.querySelector("#an-meta").textContent = "";
+          render(root.querySelector("#an-body"), html`<p class="muted small">${analysisAvailable === false ? "No engine available on the server for analysis." : "Not analysed yet."}</p>`);
+        }
+        return;
+      }
+      card.hidden = false;
+      root.querySelector("#an-meta").textContent = `${analysis.engine || "engine"} · depth ${analysis.depth}`;
+      const rows = ["white", "black"].map((side) => {
+        const pid = side === "white" ? game.white_id : game.black_id;
+        const name = side === "white" ? game.white_name || game.white_id : game.black_name || game.black_id;
+        const p = (analysis.players || {})[pid];
+        if (!p) return "";
+        return html`<div class="as-row"><span class="side-dot ${side}" aria-hidden="true"></span> <strong>${name}</strong>
+          ${p.moves ? html`ACPL ${fmtNum(p.acpl)} · ${p.blunders} blunder${p.blunders === 1 ? "" : "s"}, ${p.mistakes} mistake${p.mistakes === 1 ? "" : "s"}, ${p.inaccuracies} inaccurac${p.inaccuracies === 1 ? "y" : "ies"} · best move ${fmtNum((100 * p.best_moves) / p.moves)}% of ${p.moves}` : html`<span class="muted">no judged moves</span>`}
+          ${p.missed_win ? html`<span class="text-bad"> · missed win</span>` : ""}</div>`;
+      });
+      // eval strip: one bar per analysed ply, from white's point of view
+      const bars = (analysis.moves || []).map((ev) => {
+        const cpWhite = ev.player_id === game.white_id ? ev.eval_after : -ev.eval_after;
+        const h = Math.max(6, Math.min(100, 50 + cpWhite / 20));
+        const side = cpWhite >= 0 ? "w" : "b";
+        return html`<span class="${side}${ev.ply + 1 === idx ? " cur" : ""}" style="height:${h.toFixed(0)}%" title="ply ${ev.ply + 1}: ${(cpWhite / 100).toFixed(2)} for white${ev.judged && ev.loss >= 50 ? ` · ${lossClass(ev.loss)}` : ""}" data-ply="${ev.ply + 1}"></span>`;
+      });
+      render(root.querySelector("#an-body"), html`<div class="analysis-summary">${rows}</div>
+        <div class="eval-strip" role="img" aria-label="Evaluation after each move, white's point of view">${bars}</div>
+        <p class="muted small">Positions already decided (both evaluations beyond ±6) are not judged. ?! ≥ 50, ? ≥ 100, ?? ≥ 300 centipawns lost.</p>`);
+    }
+
+    async function loadAnalysis() {
+      if (!game || game.status !== "finished") { analysis = null; evalByPly = new Map(); paintAnalysis(); return; }
+      try {
+        analysis = await get(`games/${enc(gameId)}/analysis`);
+      } catch (e) {
+        analysis = null;
+        if (e && e.status !== 404 && e.status !== 0) console.warn(e);
+      }
+      if (!alive) return;
+      evalByPly = new Map((analysis && analysis.moves ? analysis.moves : []).map((ev) => [ev.ply, ev]));
+      if (analysisAvailable === null) {
+        try { analysisAvailable = !!(await get("analysis/status")).available; } catch (_) { analysisAvailable = null; }
+      }
+      paintAnalysis();
+      paintMoves();
+      if (idx > 0) paintDetail();
     }
 
     function livePending() {
@@ -237,6 +341,7 @@ export default {
       paintBoard();
       paintMoves();
       paintDetail();
+      if (analysis) paintAnalysis();
     }
 
     function paintAll() {
@@ -259,6 +364,7 @@ export default {
         if (!wasLayout) layout();
         idx = following ? moves.length : Math.min(idx, moves.length);
         paintAll();
+        if (g.status === "finished" && (first || !analysis)) loadAnalysis(); else paintAnalysis();
       } catch (e) {
         if (!alive) return;
         if (!game) root.querySelector("#game-body").innerHTML = "";
@@ -308,12 +414,13 @@ export default {
       pendingIllegal = [];
       load(false);
     });
+    subs.on("game_analysed", (e) => { if (game && e.game_id === game.id) loadAnalysis(); });
     subs.on("_reconnect", () => load(false));
 
     // ---- controls
     const onClick = async (e) => {
       if (e.target.closest("[data-action=retry]")) { load(true); return; }
-      const mv = e.target.closest(".mv[data-ply]");
+      const mv = e.target.closest(".mv[data-ply], .eval-strip [data-ply]");
       if (mv) { goto(Number(mv.dataset.ply)); return; }
       const nav = e.target.closest("[data-nav]");
       if (nav && game && root.contains(nav) && nav.closest(".board-controls")) {
@@ -328,6 +435,20 @@ export default {
         act.setAttribute("aria-pressed", String(flipped));
         board.flip(flipped);
         paintBoard();
+      } else if (act.dataset.act === "analyse") {
+        act.disabled = true;
+        try {
+          analysis = await post(`games/${enc(game.id)}/analysis`);
+          evalByPly = new Map((analysis.moves || []).map((ev) => [ev.ply, ev]));
+          toast("Analysis complete", "ok");
+          paintAnalysis();
+          paintMoves();
+          if (idx > 0) paintDetail();
+        } catch (err) {
+          toast(err && err.message ? err.message : "Analysis failed", "warn");
+        } finally {
+          act.disabled = false;
+        }
       } else if (act.dataset.act === "fen") {
         const fen = idx === 0 ? game.initial_fen : moves[idx - 1].fen_after;
         toast((await copyText(fen)) ? "FEN copied to clipboard" : "Could not copy — FEN is shown below the board", "info");

@@ -37,7 +37,8 @@ def test_auth_failures(client, agent):
     assert client.get("/api/agent/turn", params={"wait": 0}).status_code == 401
     me = client.get("/api/agent/me", headers=headers).json()
     assert me["player"]["id"] == "bot" and me["online"] is True
-    assert client.get("/api/agent/me", params={"token": token}).status_code == 200
+    # ?token= is not accepted over HTTP (it would leak into access logs); header only
+    assert client.get("/api/agent/me", params={"token": token}).status_code == 401
     # a token pointing at a non-remote player is forbidden
     client.app.state.db.set_player_token("rnd", hash_token("ac_fake"))
     assert client.get("/api/agent/me", headers={"Authorization": "Bearer ac_fake"}).status_code == 403
@@ -105,8 +106,10 @@ def test_http_agent_full_game(client, agent):
             stale_checked = True
 
         mv = random.choice(req["legal_moves_san"])
+        usage = {"input_tokens": 100, "output_tokens": 50, "cost_usd": 0.01, "model": "test-model",
+                 "Bad Key": 1, "negative": -3, "flag": True, "nested": {"a": 1}, "long": "x" * 200}
         res = client.post(f"/api/agent/games/{req['game_id']}/move", headers=headers,
-                          json={"move": mv, "request_id": req["request_id"], "comment": "hi"}).json()
+                          json={"move": mv, "request_id": req["request_id"], "comment": "hi", "usage": usage}).json()
         assert res["accepted"] and res["legal"] and res["san"] == mv and res["error"] is None
     else:
         raise AssertionError("game did not finish")
@@ -116,6 +119,11 @@ def test_http_agent_full_game(client, agent):
     assert g["status"] == "finished" and g["result"] in ("1-0", "0-1", "1/2-1/2")
     assert any(m["illegal_attempts"] for m in g["moves"])
     assert any(m["comment"] == "hi" for m in g["moves"])
+    # self-reported usage is stored (sanitised) and summed into the stats
+    used = [m["usage"] for m in g["moves"] if m["usage"].get("input_tokens")]
+    assert used and used[0] == {"input_tokens": 100, "output_tokens": 50, "cost_usd": 0.01, "model": "test-model"}
+    stats = client.get("/api/ratings").json()["stats"]["bot"]
+    assert stats["input_tokens"] >= 100 * len(used) and stats["cost_usd"] > 0
     # not your turn any more
     assert client.post(f"/api/agent/games/{gid}/move", json={"move": "e2e4"}, headers=headers).status_code == 409
     assert client.post(f"/api/agent/games/{gid}/resign", headers=headers).status_code == 409

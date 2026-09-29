@@ -328,3 +328,39 @@ async def test_garbage_comment_and_usage_do_not_abort_game():
     stored = db.get_game(game.id)
     assert stored.status == GameStatus.FINISHED and stored.termination == Termination.MAX_PLIES
     assert stored.moves[0].comment == "{'x': 1}" and len(stored.moves) == 4
+
+
+async def test_forfeit_keeps_final_attempt_and_stats(tmp_path):
+    """Illegal attempts and token usage of the move that ended the game are kept (final_attempt)
+    and counted by move_stats; a very long comment is truncated before storage/broadcast."""
+    from agentchess.db import MAX_COMMENT_CHARS, Database
+
+    db = Database(str(tmp_path / "g.db"))
+    for pid in ("w", "b"):
+        db.add_player(spec(pid))
+    game = new_game(max_illegal_attempts=2)
+    db.add_game(game)
+    bus = EventBus()
+    q = bus.subscribe()
+    long_comment = "x" * (MAX_COMMENT_CHARS + 500)
+    white = Scripted("w", [MoveResponse(move="e4", comment=long_comment, usage={"input_tokens": 7}), "zz", "yy"])
+    black = Scripted("b", ["e5"])
+    out = await play_game(game, white, black, db=db, bus=bus)
+    assert out.termination == Termination.ILLEGAL_MOVES and out.result == "0-1"
+    fa = out.final_attempt
+    assert fa and fa["player_id"] == "w" and fa["ply"] == 2 and fa["attempt"] == 3
+    assert [a["move"] for a in fa["illegal_attempts"]] == ["zz", "yy"]
+    assert fa["usage"] == {"input_tokens": 20, "output_tokens": 10}   # both bad answers' tokens
+    stored = db.get_game(game.id)
+    assert stored.final_attempt == fa and stored.to_dict()["final_attempt"] == fa
+    st = db.move_stats()["w"]
+    assert st["illegal_attempts"] == 2 and st["input_tokens"] == 7 + 20 and st["moves"] == 1
+    assert len(stored.moves[0].comment) == MAX_COMMENT_CHARS
+    events = [q.get_nowait() for _ in range(q.qsize())]
+    move_ev = next(e for e in events if e["type"] == "move")
+    assert len(move_ev["comment"]) == MAX_COMMENT_CHARS
+    # a normal finish has no final_attempt
+    game2 = new_game(max_plies=2)
+    await play_game(game2, Scripted("w", ["e4"]), Scripted("b", ["e5"]), db=None)
+    assert game2.final_attempt is None
+    db.close()

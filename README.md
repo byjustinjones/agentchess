@@ -16,7 +16,17 @@ moves it tried, the time it took and the tokens it used.
   being forfeited. Everything is stored in SQLite, so a crash or restart resumes where it stopped.
 - **Ratings.** A Bradley–Terry maximum-a-posteriori fit on the Elo scale, anchored to Stockfish
   `UCI_Elo` levels, with 95% bootstrap confidence intervals, W/D/L, performance, and
-  illegal-move and forfeit rates.
+  illegal-move and forfeit rates. The same bootstrap gives pairwise "P(A is stronger than B)",
+  the leaderboard says how many more games a ±50 Elo interval would take, and crosstable cells
+  carry a sign-test p-value.
+- **Move quality.** Every finished game is analysed with Stockfish afterwards (low priority, one
+  thread): average centipawn loss, blunder/mistake/inaccuracy rates, engine-move agreement and
+  missed wins per player, shown on the leaderboard, in every game view and by `agentchess analyse`.
+  This is far more sensitive than results alone: a 56-game round robin separates models by ACPL
+  that ratings cannot separate.
+- **Claude Code relay.** `agentchess relay` plays a remote player with `claude -p`: all tools
+  disabled (fair play by construction), one session per game with a fresh session every N moves,
+  token usage and cost attached to each move.
 - **Rules for LLMs.** A configurable per-move timeout and illegal-move budget (a player that exceeds either forfeits),
   automatic threefold and fifty-move draws, and a ply cap. Legal-move hints can be turned on or off.
   Infrastructure failures (a missing API key, a provider outage, an engine crash) abort the game unrated
@@ -49,9 +59,13 @@ Headless runs (CI, batch benchmarking):
 ```bash
 agentchess run examples/tournament.yaml            # engines + random, no API keys needed
 agentchess run examples/llm_benchmark.yaml --serve # LLMs vs the engine ladder, with GUI
-agentchess ratings
+agentchess ratings                                 # table incl. P(>next), games needed, ACPL, blunders
+agentchess analyse --tournament t_...              # (re)run engine analysis, print move-quality table
 agentchess export-pgn > games.pgn
 ```
+
+Post-game analysis runs automatically in `serve` and `run` (`--analysis-depth 12`, `--no-analysis`
+to turn it off). It only ever looks at finished games and is not reachable through the agent API.
 
 ## Connecting your own agent
 
@@ -69,7 +83,10 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 ```
 
 If a move is illegal, the reply says so and tells you how many attempts remain. The next
-`turn` then carries `attempt` and `previous_error`.
+`turn` then carries `attempt` and `previous_error`. The move body may include
+`"usage": {"input_tokens": .., "output_tokens": .., "cost_usd": .., "model": ".."}` so the
+leaderboard's token and cost columns work for external agents too. Tokens go in the
+`Authorization` header only (a `?token=` query parameter is accepted just for the WebSocket).
 
 **WebSocket.** Connect to `ws://localhost:8000/api/agent/ws?token=...`. The server pushes
 `move_request` messages and the agent sends `{"type":"move","game_id":...,"move":...}`.
@@ -84,6 +101,22 @@ claude mcp add agentchess -- agentchess mcp --server http://localhost:8000 --tok
 
 Reference clients are in `examples/`: `random_agent.py`, `llm_agent.py` and `ws_agent.py`.
 
+**Claude Code relay (reproducible agent benchmark).** To measure Claude Code itself rather than a
+raw API model, run the bundled harness for a remote player:
+
+```bash
+agentchess relay --server http://localhost:8000 --token $TOKEN --model opus --effort high \
+    --moves-per-session 40 --log-dir relay-logs/
+```
+
+It long-polls for your turn, hands each position to `claude -p` with **all tools disabled**
+(`--tools "" --strict-mcp-config`, in an empty working directory: no engine, no files, no code, nothing to audit; works with a Claude subscription login, and `--bare` switches to API-key auth),
+keeps one Claude Code session per game so the model retains its own reasoning, and starts a fresh
+session after `--moves-per-session` accepted moves (the harness counts, not the model). Illegal
+answers go back to the same session with the server's error, and every move carries the tokens
+and cost `claude` reported. One process plays every concurrent game of the player; run one
+process per model.
+
 ## How ratings work
 
 Each finished game is a Bradley–Terry observation on the Elo scale:
@@ -92,6 +125,14 @@ Ratings are the maximum-a-posteriori estimate under a weak Gaussian prior, which
 scorer finite and handles players who never met. Engines configured with `UCI_Elo` are **anchors**:
 their ratings are fixed, which ties the scale to Stockfish's calibration (roughly CCRL
 blitz). Confidence intervals come from bootstrap resampling of games. Unlike incremental Elo, the fit does not depend on game order.
+
+The bootstrap replicates also give, for every pair, the probability that one player's rating is
+really above the other's (`superiority` in the API, "P(>next)" on the leaderboard) and an
+estimate of how many more games would shrink a player's interval to ±50 Elo (hover the CI).
+A ⚠ marks a player with no chain of games to an anchored engine: its rating is only relative to
+the players it met. Crosstable cells show a two-sided sign-test p-value of wins vs losses.
+With 2 games per pair nothing head-to-head can reach p ≤ 0.05; use ACPL/blunder rates
+(engine analysis) for a sensitive comparison and more games for rating claims.
 
 Tips for a meaningful benchmark:
 
@@ -113,10 +154,15 @@ agentchess/
   models.py db.py events.py          core types, SQLite storage, pub/sub
   players/ engine llm remote random  participants
   game.py moves.py openings.py       game runner, move parsing, opening suite
-  rating.py tournament.py            Elo fitting, scheduling, tournament manager
+  rating.py tournament.py            Elo fitting (+ superiority, games needed), scheduling, manager
+  analysis.py                        post-game engine analysis (ACPL, blunders, missed wins)
+  relay.py                           Claude Code relay harness (agentchess relay)
   server/ app.py agent_api.py        FastAPI REST + WebSocket + agent API
   mcp_server.py cli.py               MCP bridge, command line
   web/                               GUI (static, no build step)
 ```
+
+See [docs/REVIEW.md](docs/REVIEW.md) for the benchmark review (findings, what the live tournament
+data showed, and recommended next experiments).
 
 Run the tests with `pytest -q`.

@@ -296,7 +296,8 @@ function crosstableHtml(ct, order, names) {
         ? `color-mix(in oklab, var(--xt-pos) ${Math.round((f - 0.5) * 2 * 100)}%, var(--xt-mid))`
         : `color-mix(in oklab, var(--xt-neg) ${Math.round((0.5 - f) * 2 * 100)}%, var(--xt-mid))`;
       const ptsTxt = Number.isInteger(pts) ? String(pts) : `${Math.floor(pts) || ""}½`;
-      return html`<td class="xt-cell" style="background:${mix}" title="${names[a] || a} vs ${names[b] || b}: +${c.w || 0} =${c.d || 0} −${c.l || 0}">${ptsTxt}<span class="xt-of">/${g}</span></td>`;
+      const pTxt = c.p != null ? ` · sign test p = ${Number(c.p).toFixed(2)}${Number(c.p) <= 0.05 ? " (significant)" : ""}` : "";
+      return html`<td class="xt-cell${c.p != null && Number(c.p) <= 0.05 ? " xt-sig" : ""}" style="background:${mix}" title="${names[a] || a} vs ${names[b] || b}: +${c.w || 0} =${c.d || 0} −${c.l || 0}${pTxt}">${ptsTxt}<span class="xt-of">/${g}</span></td>`;
     });
     const tot = Number.isInteger(tp) ? String(tp) : `${Math.floor(tp) || ""}½`;
     return html`<tr><th scope="row" class="xt-name"><span class="xt-idx">${i + 1}</span> ${names[a] || a}</th>${tds}<td class="xt-total">${tot}<span class="xt-of">/${tg}</span></td></tr>`;
@@ -342,7 +343,7 @@ export const tournamentDetailView = {
           <div id="td-standings"></div>
         </section>
         <section class="card" aria-labelledby="td-xt-title">
-          <div class="card-head"><h2 id="td-xt-title">Crosstable</h2><span class="muted small">row player's points vs column player</span></div>
+          <div class="card-head"><h2 id="td-xt-title">Crosstable</h2><span class="muted small">row player's points vs column player · bold: head-to-head edge significant (sign test p ≤ 0.05)</span></div>
           <div id="td-crosstable"></div>
         </section>
         <section class="card" aria-labelledby="td-g-title">

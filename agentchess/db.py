@@ -91,9 +91,56 @@ CREATE TABLE IF NOT EXISTS moves (
     created_at REAL NOT NULL,
     PRIMARY KEY (game_id, ply)
 );
+
+-- Post-game engine analysis (agentchess/analysis.py). One row per analysed game, one
+-- per (game, player) summary and one per judged ply. Analysing again replaces all three.
+CREATE TABLE IF NOT EXISTS game_analysis (
+    game_id TEXT PRIMARY KEY REFERENCES games(id) ON DELETE CASCADE,
+    engine TEXT NOT NULL,
+    depth INTEGER NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS player_analysis (
+    game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+    player_id TEXT NOT NULL,
+    moves INTEGER NOT NULL,            -- judged moves (non-book, position not already decided)
+    total_loss REAL NOT NULL,          -- sum of centipawn losses over judged moves
+    blunders INTEGER NOT NULL,
+    mistakes INTEGER NOT NULL,
+    inaccuracies INTEGER NOT NULL,
+    best_moves INTEGER NOT NULL,       -- judged moves that matched the engine's first choice
+    max_eval INTEGER NOT NULL,         -- best evaluation the player reached (cp, own POV)
+    won INTEGER NOT NULL,              -- 1 if the player won the game
+    missed_win INTEGER NOT NULL,       -- 1 if max_eval >= WIN_CP and the player did not win
+    PRIMARY KEY (game_id, player_id)
+);
+CREATE INDEX IF NOT EXISTS idx_player_analysis_player ON player_analysis(player_id);
+CREATE TABLE IF NOT EXISTS move_evals (
+    game_id TEXT NOT NULL REFERENCES games(id) ON DELETE CASCADE,
+    ply INTEGER NOT NULL,
+    player_id TEXT NOT NULL,
+    eval_before INTEGER NOT NULL,      -- cp from the mover's point of view before the move
+    eval_after INTEGER NOT NULL,       -- cp from the mover's point of view after the move
+    loss INTEGER NOT NULL,
+    best_uci TEXT,
+    judged INTEGER NOT NULL,           -- 0 for book moves / already decided positions
+    PRIMARY KEY (game_id, ply)
+);
 """
 
+# Columns added after the first release: (table, column, DDL type/default). Applied by
+# ``Database._migrate`` with ``ALTER TABLE ... ADD COLUMN`` when missing, so an old DB
+# (e.g. one a running server still writes to) keeps working.
+MIGRATIONS: list[tuple[str, str, str]] = [
+    ("games", "final_attempt_json", "TEXT"),
+]
+
 MAX_COMMENT_CHARS = 8000
+
+
+def _col(r: sqlite3.Row, name: str) -> Any:
+    """Column value or None when the row (e.g. from an older query) lacks the column."""
+    return r[name] if name in r.keys() else None
 
 
 class Database:
@@ -108,6 +155,13 @@ class Database:
         if self.path != ":memory:":
             self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        for table, column, ddl in MIGRATIONS:
+            cols = {r["name"] for r in self._conn.execute(f"PRAGMA table_info({table})")}
+            if column not in cols:
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def close(self) -> None:
         with self._lock:
@@ -272,6 +326,7 @@ class Database:
             created_at=r["created_at"],
             started_at=r["started_at"],
             finished_at=r["finished_at"],
+            final_attempt=json.loads(r["final_attempt_json"]) if _col(r, "final_attempt_json") else None,
         )
 
     @staticmethod
@@ -308,12 +363,13 @@ class Database:
                 self.add_game(g, seq=i)
 
     def update_game(self, g: GameRecord) -> GameRecord:
-        """Persist status/result/termination/pgn/timestamps (not moves; use add_move)."""
+        """Persist status/result/termination/pgn/timestamps/final_attempt (not moves; use add_move)."""
         self._exec(
-            "UPDATE games SET status=?, result=?, termination=?, termination_detail=?, pgn=?, started_at=?, finished_at=?"
-            " WHERE id=?",
+            "UPDATE games SET status=?, result=?, termination=?, termination_detail=?, pgn=?, started_at=?, finished_at=?,"
+            " final_attempt_json=? WHERE id=?",
             (g.status.value, g.result, g.termination.value if g.termination else None, g.termination_detail,
-             g.pgn, g.started_at, g.finished_at, g.id),
+             g.pgn, g.started_at, g.finished_at,
+             json.dumps(g.final_attempt) if g.final_attempt is not None else None, g.id),
         )
         return g
 
@@ -400,7 +456,7 @@ class Database:
                 self._conn.execute("DELETE FROM moves WHERE game_id=?", (r["id"],))
                 if r["tournament_id"]:
                     self._conn.execute(
-                        "UPDATE games SET status=?, started_at=NULL, pgn=NULL WHERE id=?",
+                        "UPDATE games SET status=?, started_at=NULL, pgn=NULL, final_attempt_json=NULL WHERE id=?",
                         (GameStatus.SCHEDULED.value, r["id"]))
                 else:
                     self._conn.execute(
@@ -417,7 +473,8 @@ class Database:
                 self._conn.execute("DELETE FROM moves WHERE game_id=?", (r["id"],))
                 self._conn.execute(
                     "UPDATE games SET status=?, result=NULL, termination=NULL, termination_detail=NULL, pgn=NULL,"
-                    " started_at=NULL, finished_at=NULL WHERE id=?", (GameStatus.SCHEDULED.value, r["id"]))
+                    " started_at=NULL, finished_at=NULL, final_attempt_json=NULL WHERE id=?",
+                    (GameStatus.SCHEDULED.value, r["id"]))
         return len(rows)
 
     def rated_results(self, tournament_id: Optional[str] = None) -> list[dict[str, Any]]:
@@ -448,7 +505,115 @@ class Database:
             sql += " AND g.tournament_id=?"
             params.append(tournament_id)
         sql += " GROUP BY m.player_id"
-        return {r["player_id"]: dict(r) for r in self._all(sql, params)}
+        out = {r["player_id"]: dict(r) for r in self._all(sql, params)}
+        # The unfinished last move of forfeited/aborted games (illegal attempts, tokens) counts too.
+        fsql = "SELECT final_attempt_json FROM games WHERE status IN (?, ?) AND final_attempt_json IS NOT NULL"
+        fparams: list[Any] = [GameStatus.FINISHED.value, GameStatus.ABORTED.value]
+        if tournament_id:
+            fsql += " AND tournament_id=?"
+            fparams.append(tournament_id)
+        for r in self._all(fsql, fparams):
+            try:
+                fa = json.loads(r["final_attempt_json"])
+            except ValueError:
+                continue
+            pid = fa.get("player_id") if isinstance(fa, dict) else None
+            if not pid:
+                continue
+            d = out.setdefault(pid, {"player_id": pid, "moves": 0, "illegal_attempts": 0, "moves_with_illegal": 0,
+                                     "avg_move_s": None, "input_tokens": 0, "output_tokens": 0, "cost_usd": 0})
+            attempts = fa.get("illegal_attempts") or []
+            d["illegal_attempts"] = (d.get("illegal_attempts") or 0) + len(attempts)
+            usage = fa.get("usage") or {}
+            for k in ("input_tokens", "output_tokens", "cost_usd"):
+                v = usage.get(k)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    d[k] = (d.get(k) or 0) + v
+        return out
+
+    # ----------------------------------------------------------------- analysis
+    def save_analysis(self, game_id: str, engine: str, depth: int, moves: list[dict[str, Any]],
+                      players: dict[str, dict[str, Any]]) -> None:
+        """Replace the engine analysis of a game (see ``agentchess.analysis``)."""
+        with self.transaction():
+            for table in ("move_evals", "player_analysis", "game_analysis"):
+                self._conn.execute(f"DELETE FROM {table} WHERE game_id=?", (game_id,))
+            self._conn.execute("INSERT INTO game_analysis (game_id, engine, depth, created_at) VALUES (?,?,?,?)",
+                               (game_id, engine, depth, now()))
+            self._conn.executemany(
+                "INSERT INTO move_evals (game_id, ply, player_id, eval_before, eval_after, loss, best_uci, judged)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                [(game_id, m["ply"], m["player_id"], m["eval_before"], m["eval_after"], m["loss"],
+                  m.get("best_uci"), int(bool(m["judged"]))) for m in moves])
+            self._conn.executemany(
+                "INSERT INTO player_analysis (game_id, player_id, moves, total_loss, blunders, mistakes, inaccuracies,"
+                " best_moves, max_eval, won, missed_win) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                [(game_id, pid, s["moves"], s["total_loss"], s["blunders"], s["mistakes"], s["inaccuracies"],
+                  s["best_moves"], s["max_eval"], int(bool(s["won"])), int(bool(s["missed_win"])))
+                 for pid, s in players.items()])
+
+    def get_analysis(self, game_id: str) -> Optional[dict[str, Any]]:
+        head = self._one("SELECT * FROM game_analysis WHERE game_id=?", (game_id,))
+        if head is None:
+            return None
+        moves = [dict(r) for r in self._all("SELECT ply, player_id, eval_before, eval_after, loss, best_uci, judged"
+                                            " FROM move_evals WHERE game_id=? ORDER BY ply", (game_id,))]
+        for m in moves:
+            m["judged"] = bool(m["judged"])
+        players = {}
+        for r in self._all("SELECT * FROM player_analysis WHERE game_id=?", (game_id,)):
+            d = dict(r)
+            d.pop("game_id", None)
+            d["won"], d["missed_win"] = bool(d["won"]), bool(d["missed_win"])
+            d["acpl"] = d["total_loss"] / d["moves"] if d["moves"] else None
+            players[d.pop("player_id")] = d
+        return {"game_id": game_id, "engine": head["engine"], "depth": head["depth"],
+                "created_at": head["created_at"], "moves": moves, "players": players}
+
+    def delete_analysis(self, game_id: str) -> None:
+        with self.transaction():
+            for table in ("move_evals", "player_analysis", "game_analysis"):
+                self._conn.execute(f"DELETE FROM {table} WHERE game_id=?", (game_id,))
+
+    def unanalysed_game_ids(self, tournament_id: Optional[str] = None, player_id: Optional[str] = None,
+                            limit: int = 10**9) -> list[str]:
+        """Finished games without a stored analysis, oldest first."""
+        sql = ("SELECT g.id FROM games g LEFT JOIN game_analysis a ON a.game_id=g.id"
+               " WHERE g.status=? AND a.game_id IS NULL")
+        params: list[Any] = [GameStatus.FINISHED.value]
+        if tournament_id:
+            sql += " AND g.tournament_id=?"
+            params.append(tournament_id)
+        if player_id:
+            sql += " AND (g.white_id=? OR g.black_id=?)"
+            params += [player_id, player_id]
+        sql += " ORDER BY g.finished_at LIMIT ?"
+        params.append(limit)
+        return [r["id"] for r in self._all(sql, params)]
+
+    def analysis_stats(self, tournament_id: Optional[str] = None) -> dict[str, dict[str, Any]]:
+        """Per-player move quality over analysed finished games:
+        {player_id: {analysed_games, judged_moves, acpl, blunders, mistakes, inaccuracies,
+                     blunders_per_100, mistakes_per_100, best_move_rate, missed_wins}}."""
+        sql = ("SELECT a.player_id AS player_id, COUNT(*) AS analysed_games, SUM(a.moves) AS judged_moves,"
+               " SUM(a.total_loss) AS total_loss, SUM(a.blunders) AS blunders, SUM(a.mistakes) AS mistakes,"
+               " SUM(a.inaccuracies) AS inaccuracies, SUM(a.best_moves) AS best_moves, SUM(a.missed_win) AS missed_wins"
+               " FROM player_analysis a JOIN games g ON g.id=a.game_id WHERE g.status=?")
+        params: list[Any] = [GameStatus.FINISHED.value]
+        if tournament_id:
+            sql += " AND g.tournament_id=?"
+            params.append(tournament_id)
+        sql += " GROUP BY a.player_id"
+        out: dict[str, dict[str, Any]] = {}
+        for r in self._all(sql, params):
+            d = dict(r)
+            n = d["judged_moves"] or 0
+            d["acpl"] = (d.pop("total_loss") or 0) / n if n else None
+            d["blunders_per_100"] = 100.0 * d["blunders"] / n if n else None
+            d["mistakes_per_100"] = 100.0 * d["mistakes"] / n if n else None
+            d["best_move_rate"] = d["best_moves"] / n if n else None
+            out[d.pop("player_id")] = d
+        return out
 
     def termination_stats(self, tournament_id: Optional[str] = None) -> dict[str, dict[str, int]]:
         """{player_id: {"forfeit_illegal": n, "forfeit_timeout": n, "forfeit_error": n, "resigned": n}} (losses only)."""

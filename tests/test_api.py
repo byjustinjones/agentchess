@@ -233,3 +233,45 @@ def test_load_dotenv(tmp_path, monkeypatch):
     assert os.environ["AGENTCHESS_T1"] == "abc" and os.environ["AGENTCHESS_T2"] == "q v"
     assert os.environ["AGENTCHESS_T3"] == "existing"
     monkeypatch.delenv("AGENTCHESS_T1"); monkeypatch.delenv("AGENTCHESS_T2")
+
+
+def test_bad_types_are_4xx_not_500(client):
+    for n in ("A", "B"):
+        add(client, n)
+    bad_configs = [
+        {"player_ids": ["a", "b"], "games_per_pair": "two", "openings": "none"},
+        {"player_ids": ["a", "b"], "openings": "none", "game": {"move_timeout_s": "slow"}},
+        {"player_ids": "ab", "openings": "none"},
+        {"player_ids": ["a", "b"], "openings": "none", "concurrency": None},
+    ]
+    for cfg in bad_configs:
+        r = client.post("/api/tournaments", json={"name": "bad", "config": cfg})
+        assert r.status_code in (400, 422), (cfg, r.status_code)
+    r = client.post("/api/games", json={"white_id": "a", "black_id": "b", "config": {"max_plies": "many"}})
+    assert r.status_code == 422
+    r = client.post("/api/games", json={"white_id": "a", "black_id": "b", "config": {"max_plies": 0}})
+    assert r.status_code == 400
+    # odd games_per_pair with the opening suite is rejected with an explanation
+    r = client.post("/api/tournaments", json={"name": "odd", "config": {"player_ids": ["a", "b"], "games_per_pair": 3,
+                                                                       "openings": "builtin"}})
+    assert r.status_code == 400 and "even" in r.json()["detail"]
+    r = client.post("/api/tournaments", json={"name": "odd", "config": {"player_ids": ["a", "b"], "games_per_pair": 3,
+                                                                       "openings": "none", "game": FAST_GAME}})
+    assert r.status_code == 201
+
+
+def test_ratings_include_superiority_and_extras(client):
+    for n in ("A", "B"):
+        add(client, n)
+    t = client.post("/api/tournaments", json={"name": "s", "config": {"player_ids": ["a", "b"], "games_per_pair": 2,
+                                                                     "openings": "none", "game": FAST_GAME},
+                                              "start": True}).json()
+    d = wait_for(lambda: (lambda x: x if x["status"] == "finished" else None)(client.get(f"/api/tournaments/{t['id']}").json()),
+                 timeout=60)
+    assert set(d["superiority"]) == {"a", "b"} and 0 <= d["superiority"]["a"]["b"] <= 1
+    row = d["standings"][0]
+    assert {"opponents", "linked_to_anchor", "games_for_ci50", "p_above_next"} <= set(row)
+    cell = d["crosstable"]["cells"]["a"]["b"]
+    assert "p" in cell
+    r = client.get("/api/ratings", params={"tournament_id": t["id"]}).json()
+    assert set(r["superiority"]) == {"a", "b"}

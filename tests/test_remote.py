@@ -142,3 +142,20 @@ async def test_remote_timeout_cleans_up():
     await play_game(game, RemotePlayer(spec, hub), rnd)
     assert game.termination == Termination.TIMEOUT
     assert hub.pending_requests("agent") == []
+
+
+async def test_is_ready_is_stricter_than_is_online():
+    hub = AgentHub()
+    assert not hub.is_ready("a")
+    hub.touch("a")
+    assert hub.is_ready("a") and hub.is_online("a")
+    hub._last_seen["a"] -= 30            # silent for 30 s: still "online" (60 s grace), not ready for a new game
+    assert hub.is_online("a") and not hub.is_ready("a")
+    hub.connect("a")                     # an open websocket makes it ready regardless
+    assert hub.is_ready("a")
+    hub.disconnect("a")
+    hub._last_seen["a"] -= 30
+    waiter = asyncio.create_task(hub.wait_for_request("a", 0.2))
+    await asyncio.sleep(0.01)
+    assert hub.is_ready("a")             # an in-flight long-poll counts too
+    await waiter

@@ -24,12 +24,14 @@ agentchess/
   moves.py           parse_move(board, text) -> chess.Move  (UCI or SAN, tolerant)
   game.py            play_game(...) runner
   openings.py        BUILTIN_OPENINGS: list[Opening]
-  rating.py          compute_ratings(...) Bradley-Terry/Elo MLE + bootstrap CIs; crosstable
+  rating.py          compute_ratings(...)/rating_report(...) Bradley-Terry/Elo MAP + bootstrap CIs, superiority; crosstable
+  analysis.py        post-game engine analysis: analyse_moves, EngineAnalyser, AnalysisService
+  relay.py           Claude Code relay harness (`agentchess relay`)
   tournament.py      schedule_games(...), TournamentManager
   server/app.py      FastAPI app factory create_app(settings) — REST + WS + agent API + static GUI
   server/agent_api.py  routes for external agents (HTTP long-poll + WebSocket)
   mcp_server.py      stdio MCP server bridging an MCP-capable agent to the agent API
-  cli.py             `agentchess serve|run|ratings|export-pgn|mcp|add-player`
+  cli.py             `agentchess serve|run|ratings|analyse|relay|export-pgn|mcp|add-player`
   web/               static GUI (index.html, app.js, style.css) — no build step
 ```
 
@@ -100,6 +102,7 @@ class AgentHub:
     # called by the agent API
     def touch(self, player_id: str) -> None                         # mark agent as seen (online)
     def is_online(self, player_id: str, within_s: float = 60) -> bool   # seen recently OR has an open websocket OR is currently long-polling
+    def is_ready(self, player_id: str, within_s: float = 10) -> bool    # stricter: used by the scheduler before *starting* a game
     def pending_requests(self, player_id: str) -> list[MoveRequest]
     async def wait_for_request(self, player_id: str, timeout_s: float) -> MoveRequest | None   # long-poll
     def submit(self, player_id: str, request_id: str, resp: MoveResponse) -> bool   # resolves the pending future; False if unknown/expired
@@ -133,6 +136,11 @@ async def play_game(
   `attempt+1` and `previous_error`, loss (`ILLEGAL_MOVES`) after `max_illegal_attempts` bad answers on one move.
 - A player raising `players.base.InfrastructureError` (missing API key, provider outage after retries,
   rejected config, engine crash) ends the game as ABORTED with result `*` — unrated, never a forfeit.
+- When the game ends *during* a move (illegal-move forfeit, timeout, resignation, error, abort) the
+  attempts and usage of that unfinished move are kept in `GameRecord.final_attempt`
+  (`{player_id, color, ply, attempt, illegal_attempts, usage, elapsed_s}`, column `games.final_attempt_json`)
+  and counted by `db.move_stats`. Comments are truncated to `db.MAX_COMMENT_CHARS` before they are
+  stored or broadcast.
 - Game end: checkmate, stalemate, insufficient material, **automatic** claim of threefold
   repetition and fifty-move rule (`board.can_claim_draw()` style — use `is_repetition(3)` / `is_fifty_moves()`),
   and `max_plies` → draw (`MAX_PLIES`). Also fivefold/75-move via `board.outcome()`.
@@ -157,9 +165,18 @@ class RatingRow:
     games: int; wins: int; draws: int; losses: int; score: float  # score = points/games
     performance: float | None                    # simple performance rating vs opponents' final elo
     rank: int
-def compute_ratings(results: list[dict], players: list[PlayerSpec], *, use_anchors: bool = True,
-                    base: float = 1500.0, prior_sd: float = 400.0, bootstrap: int = 300, seed: int = 0) -> list[RatingRow]
-def crosstable(results: list[dict], player_ids: list[str]) -> dict   # {"players":[ids], "cells": {a: {b: {"w":..,"d":..,"l":..,"score":..,"games":..}}}}
+    opponents: int                               # distinct opponents
+    linked_to_anchor: bool                       # False: no chain of games to an anchor (rating only relative to its group)
+    games_for_ci50: int | None                   # ~extra games for a +-50 CI (half-width ~ 1/sqrt(n)); None if there / anchored
+    p_above_next: float | None                   # bootstrap P(rating > next-ranked player's rating)
+@dataclass
+class RatingReport:
+    rows: list[RatingRow]
+    superiority: dict[str, dict[str, float]]     # superiority[a][b] = P(rating_a > rating_b) over bootstrap replicates
+def rating_report(results, players, *, use_anchors=True, base=1500.0, prior_sd=400.0, bootstrap=300, seed=0) -> RatingReport
+def compute_ratings(...same...) -> list[RatingRow]                  # = rating_report(...).rows
+def crosstable(results: list[dict], player_ids: list[str]) -> dict   # {"players":[ids], "cells": {a: {b: {"w","d","l","score","games","p"}}}}
+                                                                     # p: two-sided exact sign test of wins vs losses (draws ignored), None without decisive games
 def expected_score(ra: float, rb: float) -> float
 ```
 Model: Bradley–Terry on the Elo scale (P(A beats B) = 1/(1+10^((Rb-Ra)/400))), draws count as half a
@@ -169,6 +186,33 @@ fixed; the prior center is the mean of anchors if any else `base`; without ancho
 so their mean is `base`. Solve with Newton or MM iterations to convergence. CIs from bootstrap
 resampling of games (anchored players have zero-width CI). Only players with ≥1 rated game are
 returned, sorted by elo desc. Pure Python (no numpy requirement).
+
+## Post-game analysis — `analysis.py`
+Engine-agnostic core plus a Stockfish driver; never touches running games.
+```python
+async def analyse_moves(game: GameRecord, evaluate: Evaluator) -> tuple[list[MoveEval], dict[str, PlayerSummary]]
+    # Evaluator: async board -> (cp for side to move, engine's first choice). Each position is evaluated once.
+    # MoveEval(ply, player_id, eval_before, eval_after, loss, best_uci, judged)   evals from the mover's POV, clamped to +-1000
+    # judged = False for book moves and when both evals are beyond DECIDED_CP (600): a lost game is not judged further.
+    # PlayerSummary: moves (judged), total_loss, blunders (>=300), mistakes (>=100), inaccuracies (>=50),
+    #                best_moves (played the engine's first choice), max_eval, won, missed_win (max_eval >= 500 and not won)
+class EngineAnalyser:   # one `nice -n 19`, Threads=1 engine process; analyse(game) -> GameAnalysis
+class AnalysisService:  # background queue used by the server: enqueue(game_id), enqueue_missing(tournament_id), analyse_now(game_id)
+```
+Storage: tables `game_analysis` (engine, depth), `player_analysis` (per game & player summary) and `move_evals`
+(per ply). `db.analysis_stats(tournament_id)` aggregates per player: `analysed_games, judged_moves, acpl,
+blunders, mistakes, inaccuracies, blunders_per_100, mistakes_per_100, best_moves, best_move_rate, missed_wins`.
+The server (`Settings.analysis_depth`, default 12; `analysis_auto`) queues every finished game; the CLI
+`agentchess analyse` does the same offline. Event: `{"type":"game_analysed","game_id":..,"players":{..}}`.
+
+## Relay harness — `relay.py`
+`agentchess relay` plays one remote player with Claude Code: `Relay` long-polls `/api/agent/turn`, formats the
+position (`format_position`), runs `claude -p --output-format json --tools "" --strict-mcp-config
+--permission-prompts none [--model M] [--effort E] [--resume SESSION]` (`ClaudeRunner`), extracts the
+`MOVE:` line (fallback: last legal move mentioned; one re-ask if none), posts the move with the reply as
+comment and `usage` = claude's tokens/cost + `relay_session`/`session_move`. One session per game;
+after `moves_per_session` accepted moves the session is dropped (takeover prompt for the next one).
+Tests drive it with `tests/fake_claude.py`.
 
 ## Tournaments — `tournament.py`
 ```python
@@ -193,7 +237,9 @@ class TournamentManager:
 ```
 Scheduler loop per tournament: repeatedly pick the earliest SCHEDULED game (by seq) whose players each
 have spare capacity (global per-player count across all tournaments < `max_concurrent_games`) and,
-if `wait_for_remote`, whose remote players are online; keep ≤ `config.concurrency` running. Finished
+if `wait_for_remote`, whose remote players are *ready* (`AgentHub.is_ready`: connected, long-polling or
+seen within 10 s — a crashed agent must not be handed a game it will forfeit on time); keep ≤
+`config.concurrency` running. `games_per_pair` must be even with builtin openings. Finished
 when no SCHEDULED/RUNNING games remain → status FINISHED + event. Robust: one failing game never kills
 the loop; a player-construction error forfeits that game (`ERROR`).
 
@@ -206,6 +252,7 @@ All events are dicts with `type`:
 - `{"type":"game_finished","game": GameRecord.to_dict(include_moves=False)}`
 - `{"type":"tournament_updated","tournament": Tournament.to_dict(), "progress": {...}}`
 - `{"type":"agent_status","player_id":..,"online":bool}`
+- `{"type":"game_analysed","game_id":..,"players":{player_id: PlayerSummary dict}}`
 
 ## REST API (server/app.py) — JSON
 All under `/api`. Errors: HTTP 4xx with `{"detail": "..."}`.
@@ -222,23 +269,28 @@ All under `/api`. Errors: HTTP 4xx with `{"detail": "..."}`.
 | POST `/api/players/{id}/token` | | `{"token": ...}` (rotate remote token) |
 | GET `/api/tournaments` | | `[Tournament.to_dict() + {"progress": {...}}]` |
 | POST `/api/tournaments` | `{name, config: TournamentConfig dict, start?: bool}` | tournament + progress |
-| GET `/api/tournaments/{id}` | | tournament + progress + `{"standings": [RatingRow], "crosstable": {...}, "players":[PlayerSpec]}` |
+| GET `/api/tournaments/{id}` | | tournament + progress + `{"standings": [RatingRow], "superiority": {a:{b:p}}, "crosstable": {...}, "players":[PlayerSpec]}` |
+| POST `/api/tournaments/{id}/analyse` | | `{"queued": n, "pending": n}` — queue engine analysis of finished games lacking one (503 without engine) |
 | POST `/api/tournaments/{id}/start` / `pause` / `cancel` | | tournament |
 | POST `/api/tournaments/{id}/retry-aborted` | | tournament — reschedules ABORTED games (infra failures, cancel) and runs them |
 | DELETE `/api/tournaments/{id}` | | `{"deleted": true}` (not while running) |
 | GET `/api/games` | `?tournament_id&status&player_id&limit&offset&order=seq|recent` | `{"games":[GameRecord.to_dict(False) + white_name/black_name], "total": n}` |
 | POST `/api/games` | `{white_id, black_id, config?: GameConfig, opening_id?}` | game (ad-hoc exhibition) |
 | GET `/api/games/{id}` | | GameRecord.to_dict(True) + white_name/black_name |
+| GET `/api/games/{id}/analysis` | | stored analysis `{game_id, engine, depth, created_at, moves:[MoveEval], players:{pid: summary}}` (404 until analysed) |
+| POST `/api/games/{id}/analysis` | | analyse a finished game now (409 if not finished, 503 without engine) → same shape |
+| GET `/api/analysis/status` | | `{"available", "depth", "engine", "pending", "auto"}` |
 | GET `/api/games/{id}/pgn` | | `text/plain` PGN (built on the fly if unfinished) |
 | GET `/api/pgn` | `?tournament_id` | all finished games as one PGN file |
-| GET `/api/ratings` | `?tournament_id&anchors=true|false` | `{"ratings":[RatingRow], "stats": {player_id: move_stats + termination_stats}, "games": n}` |
+| GET `/api/ratings` | `?tournament_id&anchors=true|false` | `{"ratings":[RatingRow], "superiority": {a:{b:p}}, "stats": {player_id: move_stats + termination_stats + analysis_stats}, "games": n}` |
 | GET `/api/live` | | `{"games":[running GameRecord.to_dict(True) + names]}` |
 | GET `/api/openings` | | `[Opening]` |
 | GET `/api/agents` | | `AgentHub.status()` |
 | WS `/ws` | | stream of events above; on connect sends `{"type":"hello"}` |
 
 ## Agent API (server/agent_api.py) — for external agents
-Auth: `Authorization: Bearer <token>` (or `?token=` for WS).
+Auth: `Authorization: Bearer <token>`; the WebSocket route alone also accepts `?token=` (browsers cannot
+set headers there). HTTP routes ignore a query token so it never lands in access logs.
 
 | Method & path | Notes |
 |---|---|
@@ -246,8 +298,8 @@ Auth: `Authorization: Bearer <token>` (or `?token=` for WS).
 | GET `/api/agent/turn?wait=30` | long-poll ≤ 60 s. 200 → `MoveRequest` JSON (oldest pending); 204 → nothing yet. Marks agent online. |
 | GET `/api/agent/games` | agent's running games `[{game_id, color, opponent, fen, your_turn}]` |
 | GET `/api/agent/games/{game_id}` | game state incl. pending `request` if it is the agent's turn |
-| POST `/api/agent/games/{game_id}/move` | `{"move": "e2e4", "request_id"?: ..., "comment"?: ...}` → `{"accepted": bool, "legal": bool, "error": str|null, "attempts_remaining": int, "san": str|null}`; 409 if not your turn |
+| POST `/api/agent/games/{game_id}/move` | `{"move": "e2e4", "request_id"?: ..., "comment"?: ..., "usage"?: {...}}` → `{"accepted": bool, "legal": bool, "error": str|null, "attempts_remaining": int, "san": str|null}`; 409 if not your turn. `usage` (self-reported tokens/cost, e.g. `input_tokens`, `output_tokens`, `cost_usd`, `model`) is sanitised (`agent_api.clean_usage`: ≤16 snake_case keys, non-negative numbers or short strings), stored with the move and summed into the stats; comments are cut at 8000 chars |
 | POST `/api/agent/games/{game_id}/resign` | |
-| WS `/api/agent/ws?token=...` | server → `{"type":"move_request","request": MoveRequest}`, `{"type":"game_started",...}`, `{"type":"game_ended",...}`, `{"type":"move_result",...}`; client → `{"type":"move","game_id":..,"move":..,"request_id"?:..,"comment"?:..}`, `{"type":"resign","game_id":..}`, `{"type":"ping"}` |
+| WS `/api/agent/ws?token=...` | server → `{"type":"move_request","request": MoveRequest}`, `{"type":"game_started",...}`, `{"type":"game_ended",...}`, `{"type":"move_result",...}`; client → `{"type":"move","game_id":..,"move":..,"request_id"?:..,"comment"?:..,"usage"?:{..}}`, `{"type":"resign","game_id":..}`, `{"type":"ping"}` |
 
 `MoveRequest` JSON = `dataclasses.asdict(MoveRequest)` (see models.py).

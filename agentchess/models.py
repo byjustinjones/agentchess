@@ -183,6 +183,11 @@ class GameRecord:
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
     ply_count: Optional[int] = None         # set by list queries that don't load moves
+    # The move that was being played when the game ended without that move being made
+    # (illegal-move forfeit, timeout, resignation, error, abort): the illegal attempts and
+    # token usage of that move would otherwise be lost. {player_id, color, ply, attempt,
+    # illegal_attempts: [MoveAttempt dicts], usage: {...}, elapsed_s}.
+    final_attempt: Optional[dict[str, Any]] = None
 
     def to_dict(self, include_moves: bool = True) -> dict[str, Any]:
         d = {
@@ -203,6 +208,7 @@ class GameRecord:
             "started_at": self.started_at,
             "finished_at": self.finished_at,
             "ply_count": len(self.moves) if self.moves or self.ply_count is None else self.ply_count,
+            "final_attempt": self.final_attempt,
         }
         if include_moves:
             d["moves"] = [m.to_dict() for m in self.moves]
