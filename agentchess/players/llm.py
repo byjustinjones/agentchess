@@ -156,6 +156,11 @@ class LLMReply:
     stop_reason: Optional[str] = None
 
 
+def _is_local_url(url: str) -> bool:
+    host = (httpx.URL(url).host or "").lower()
+    return host in ("localhost", "127.0.0.1", "::1", "0.0.0.0") or host.endswith(".local")
+
+
 class TransientError(Exception):
     """A retryable provider failure (rate limit, overload, network)."""
 
@@ -309,9 +314,12 @@ class LLMPlayer(Player):
         body.update(cfg.extra_body)
         headers = {"Content-Type": "application/json"}
         key = os.environ.get(cfg.api_key_env)
+        url = (cfg.base_url or DEFAULT_OPENAI_BASE_URL).rstrip("/") + "/chat/completions"
         if key:
             headers["Authorization"] = f"Bearer {key}"
-        url = (cfg.base_url or DEFAULT_OPENAI_BASE_URL).rstrip("/") + "/chat/completions"
+        elif not _is_local_url(url):
+            # Local servers (Ollama, vLLM) may run without auth; hosted endpoints never do.
+            raise InfrastructureError(f"environment variable {cfg.api_key_env} is not set")
         try:
             resp = await self._http_client().post(url, json=body, headers=headers)
         except httpx.TransportError as e:

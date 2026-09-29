@@ -289,7 +289,8 @@ async def test_openai_no_key_refusal_and_errors(monkeypatch):
         return replies.pop(0)
 
     http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
-    player = LLMPlayer(llm_spec(provider="openai", model="m", api_key_env="AGENTCHESS_NO_KEY"), http_client=http)
+    player = LLMPlayer(llm_spec(provider="openai", model="m", api_key_env="AGENTCHESS_NO_KEY",
+                                base_url="http://localhost:11434/v1"), http_client=http)
     resp = await player.get_move(make_request())
     assert resp.move == "" and "refused" in resp.comment
     assert "authorization" not in seen[0].headers
@@ -297,3 +298,11 @@ async def test_openai_no_key_refusal_and_errors(monkeypatch):
     with pytest.raises(RuntimeError, match="401"):
         await player.get_move(make_request())
     await http.aclose()
+
+
+async def test_openai_hosted_endpoint_requires_key(monkeypatch):
+    monkeypatch.delenv("AGENTCHESS_KILO_TEST", raising=False)
+    player = LLMPlayer(llm_spec(provider="openai", model="openai/gpt-5.5", api_key_env="AGENTCHESS_KILO_TEST",
+                                base_url="https://api.kilo.ai/api/gateway"))
+    with pytest.raises(InfrastructureError, match="AGENTCHESS_KILO_TEST is not set"):
+        await player.get_move(make_request())

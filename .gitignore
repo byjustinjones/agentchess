@@ -7,3 +7,5 @@ dist/
 data/*.db*
 /agentchess.db*
 .pytest_cache/
+.env
+*.env

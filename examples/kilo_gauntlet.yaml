@@ -1,0 +1,50 @@
+# Full gauntlet: every Kilo model plays the anchored engine ladder (2 games per pair, one per
+# colour), on the same scale as the Claude tournament. Needs KILO_API_KEY in the environment (never put the key in this file).
+#   agentchess run examples/kilo_gauntlet.yaml --db data/kilo.db
+# Then check tokens/cost per game:  agentchess ratings --db data/kilo.db
+#
+# Model ids: Kilo Gateway uses "<provider>/<model>" ids. Verify each id against the gateway's
+# model list in your Kilo dashboard before running; a wrong id aborts the game unrated
+# (infrastructure failure) rather than scoring a loss. Fill in real prices so the
+# leaderboard shows cost.
+
+x-kilo: &kilo
+  provider: openai                          # Kilo Gateway is OpenAI-compatible
+  base_url: https://api.kilo.ai/api/gateway
+  api_key_env: KILO_API_KEY
+  max_tokens: 16000                         # room for reasoning models; a cut-off reply counts as an illegal attempt
+  request_timeout_s: 600
+
+players:
+  - id: kilo-gpt-5-5
+    name: GPT-5.5 (Kilo)
+    kind: llm
+    config: {<<: *kilo, model: openai/gpt-5.5}
+    max_concurrent_games: 2
+  # Bridge model: a Claude model through the same single-prompt harness, so these results can
+  # be compared with the agent-based Claude tournament. Verify the exact id in Kilo.
+  - id: kilo-claude-sonnet
+    name: Claude Sonnet (Kilo, API)
+    kind: llm
+    config: {<<: *kilo, model: anthropic/claude-sonnet-5.5}
+    max_concurrent_games: 2
+  # Add more models the same way, e.g.:
+  # - {id: kilo-gemini, name: Gemini (Kilo), kind: llm, config: {<<: *kilo, model: google/<model-id>}}
+  - random
+  - sf-skill0-d1
+  - sf-1320
+  - sf-1500
+
+tournament:
+  name: Kilo models vs Stockfish ladder
+  format: gauntlet
+  candidate_ids: [kilo-gpt-5-5, kilo-claude-sonnet]
+  games_per_pair: 2
+  openings: builtin
+  concurrency: 4
+  seed: 1
+  game:                      # same rules as the Claude agent tournament
+    move_timeout_s: 600
+    max_illegal_attempts: 3
+    max_plies: 300
+    show_legal_moves: true

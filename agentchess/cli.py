@@ -162,7 +162,8 @@ async def _run_async(args: argparse.Namespace) -> int:
                 g = ev["game"]
                 done += 1
                 print(f"[{done}/{total}] {names.get(g['white_id'], g['white_id'])} {g.get('result') or '*'} "
-                      f"{names.get(g['black_id'], g['black_id'])}  ({g.get('termination')}, {g.get('ply_count')} plies)",
+                      f"{names.get(g['black_id'], g['black_id'])}  ({g.get('termination')}, {g.get('ply_count')} plies)"
+                      + (f" - {g['termination_detail']}" if g.get('status') == 'aborted' and g.get('termination_detail') else ""),
                       flush=True)
             cur = db.get_tournament(t.id)
             if cur is None or cur.status in (TournamentStatus.FINISHED, TournamentStatus.CANCELLED):
