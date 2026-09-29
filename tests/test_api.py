@@ -218,3 +218,18 @@ def test_seed_default_players(tmp_path):
 
 def test_token_hash_is_sha256():
     assert len(hash_token("ac_x")) == 64
+
+
+def test_load_dotenv(tmp_path, monkeypatch):
+    from agentchess.cli import load_dotenv
+    env = tmp_path / ".env"
+    env.write_text("# comment\nAGENTCHESS_T1=abc\nexport AGENTCHESS_T2='q v'\nAGENTCHESS_T3=keep\n")
+    env.chmod(0o600)
+    monkeypatch.delenv("AGENTCHESS_T1", raising=False)
+    monkeypatch.delenv("AGENTCHESS_T2", raising=False)
+    monkeypatch.setenv("AGENTCHESS_T3", "existing")
+    assert load_dotenv(env) == ["AGENTCHESS_T1", "AGENTCHESS_T2"]
+    import os
+    assert os.environ["AGENTCHESS_T1"] == "abc" and os.environ["AGENTCHESS_T2"] == "q v"
+    assert os.environ["AGENTCHESS_T3"] == "existing"
+    monkeypatch.delenv("AGENTCHESS_T1"); monkeypatch.delenv("AGENTCHESS_T2")

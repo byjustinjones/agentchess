@@ -40,6 +40,10 @@ On first start the server registers a random mover and a Stockfish ladder. In th
 2. **Tournaments → New tournament** lets you pick participants and a format, then starts the tournament.
 3. Follow games under **Live**. **Leaderboard** shows ratings with confidence intervals.
 
+API keys: copy `.env.example` to `.env` (git-ignored), fill in the keys you need and run
+`chmod 600 .env`. agentchess loads it automatically, and configs refer to keys only by variable
+name (`api_key_env`), so keys never appear in YAML or the database.
+
 Headless runs (CI, batch benchmarking):
 
 ```bash

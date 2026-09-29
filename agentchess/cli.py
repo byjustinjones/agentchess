@@ -333,11 +333,40 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def load_dotenv(path: Path = Path(".env")) -> list[str]:
+    """Load ``KEY=value`` lines from ``path`` into the environment (existing variables win).
+
+    Keeps API keys out of config files and shell history. Returns the names loaded (never values)."""
+    if not path.is_file():
+        return []
+    import os
+    import stat
+
+    if os.name == "posix" and path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        print(f"warning: {path} is readable by other users; run: chmod 600 {path}", file=sys.stderr)
+    loaded = []
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.removeprefix("export ").partition("=")
+        key, value = key.strip(), value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        if key and key not in os.environ:
+            os.environ[key] = value
+            loaded.append(key)
+    return loaded
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     # MCP speaks JSON-RPC on stdout: keep logs on stderr and quiet.
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO if args.command != "mcp" else logging.WARNING,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stderr)
+    loaded = load_dotenv()
+    if loaded:
+        logging.getLogger(__name__).info("loaded from .env: %s", ", ".join(loaded))
     return int(args.func(args) or 0)
 
 

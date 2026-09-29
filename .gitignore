@@ -9,3 +9,4 @@ data/*.db*
 .pytest_cache/
 .env
 *.env
+!.env.example
